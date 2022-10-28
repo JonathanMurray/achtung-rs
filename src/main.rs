@@ -1,5 +1,6 @@
 mod app;
 mod game;
+mod headless;
 mod net;
 mod user_interface;
 
@@ -35,6 +36,14 @@ fn main() -> Result<()> {
             let socket = TcpStream::connect(HOST_ADDRESS)?;
             println!("SUCCESS: {:?}", socket);
             GameMode::Client(socket)
+        }
+        Some("headless") => {
+            print!("Connecting ... ");
+            io::stdout().flush()?;
+            let socket = TcpStream::connect(HOST_ADDRESS)?;
+            println!("SUCCESS: {:?}", socket);
+            headless::run(socket);
+            return Ok(());
         }
         Some(other) => panic!("Invalid game mode: {}", other),
         None => GameMode::Offline,

@@ -33,13 +33,8 @@ pub struct App {
 impl App {
     pub fn new(mode: GameMode) -> anyhow::Result<Self> {
         let (terminal_w, terminal_h) = terminal::size()?;
-        let w = min(25, terminal_w);
-        let h = max(terminal_h, 10);
-        let size = (w, h);
-        let frame = 1;
-        let mut ui = TerminalUi::new(size, frame)?;
-
-        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", size));
+        let suggested_size = (min(25, terminal_w), max(terminal_h, 10));
+        let size;
 
         let arrow_controls =
             KeyboardControls::new([KeyCode::Up, KeyCode::Left, KeyCode::Down, KeyCode::Right]);
@@ -49,10 +44,8 @@ impl App {
             KeyCode::Char('s'),
             KeyCode::Char('d'),
         ]);
-        let east = ((w - 2, h / 2), LEFT);
-        let west = ((1, h / 2), RIGHT);
-        let top = ((w / 2, 1), DOWN);
-        let bot = ((w / 2, h - 2), UP);
+
+        let frame = 1;
 
         let networking;
         let players;
@@ -61,36 +54,44 @@ impl App {
 
         match mode {
             GameMode::Host(socket) => {
+                size = suggested_size;
+                let east = ((size.0 - 2, size.1 / 2), LEFT);
+                let west = ((1, size.1 / 2), RIGHT);
                 let local_player = Player::new("P1".to_string(), Color::Blue, west);
                 let remote_player = Player::new("P2".to_string(), Color::Green, east);
                 let local_player_i = 0;
                 let remote_player_i = 1;
                 players_controlled_by_keyboard.push((wasd_controls, local_player_i));
-                networking = Some(Networking::new(
+                networking = Some(Networking::host(
                     socket,
                     local_player_i,
                     remote_player_i,
                     local_player.direction,
                     frame,
+                    suggested_size,
                 ));
                 players = vec![local_player, remote_player];
             }
             GameMode::Client(socket) => {
-                let remote_player = Player::new("P1".to_string(), Color::Blue, west);
-                let local_player = Player::new("P2".to_string(), Color::Green, east);
                 let remote_player_i = 0;
                 let local_player_i = 1;
                 players_controlled_by_keyboard.push((wasd_controls, local_player_i));
-                networking = Some(Networking::new(
-                    socket,
-                    local_player_i,
-                    remote_player_i,
-                    local_player.direction,
-                    frame,
-                ));
+                let (n, size_from_server) =
+                    Networking::join(socket, local_player_i, remote_player_i, LEFT, frame);
+                networking = Some(n);
+                size = size_from_server;
+                let east = ((size.0 - 2, size.1 / 2), LEFT);
+                let west = ((1, size.1 / 2), RIGHT);
+                let remote_player = Player::new("P1".to_string(), Color::Blue, west);
+                let local_player = Player::new("P2".to_string(), Color::Green, east);
                 players = vec![remote_player, local_player];
             }
             GameMode::Offline => {
+                size = suggested_size;
+                let east = ((size.0 - 2, size.1 / 2), LEFT);
+                let west = ((1, size.1 / 2), RIGHT);
+                let top = ((size.0 / 2, 1), DOWN);
+                let bot = ((size.0 / 2, size.1 - 2), UP);
                 players = vec![
                     Player::new("P1".to_string(), Color::Blue, west),
                     Player::new("P2".to_string(), Color::Green, east),
@@ -104,6 +105,9 @@ impl App {
                 networking = None;
             }
         };
+
+        let mut ui = TerminalUi::new(size, frame)?;
+        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", size));
 
         let game = Game::new(size, players, frame);
 
@@ -323,6 +327,7 @@ impl App {
     }
 }
 
+#[derive(Debug)]
 pub enum ThreadMessage {
     UserInput(Event),
     Network(NetworkEvent),
@@ -349,6 +354,7 @@ impl KeyboardControls {
     }
 }
 
+#[derive(Debug)]
 pub struct SetDirectionCommand {
     pub player_i: PlayerIndex,
     pub direction: Direction,

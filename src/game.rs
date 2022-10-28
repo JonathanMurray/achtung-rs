@@ -99,6 +99,7 @@ impl Game {
     }
 }
 
+#[derive(Debug)]
 pub enum FrameReport {
     PlayerCrashed(PlayerIndex),
     PlayerWon(Color, String),

@@ -15,25 +15,50 @@ pub struct Networking {
 }
 
 impl Networking {
-    pub fn new(
-        socket: TcpStream,
+    pub fn host(
+        mut socket: TcpStream,
         local_player: PlayerIndex,
         remote_player: PlayerIndex,
         player_direction: Direction,
         frame: u32,
+        game_size: (u16, u16),
     ) -> Self {
-        let session = Arc::new(Mutex::new(Session {
-            player: local_player,
+        let session = Arc::new(Mutex::new(Session::new(
+            local_player,
             remote_player,
             player_direction,
             frame,
-            queued_command_from_remote: None,
-            has_remote_committed_frame: false,
-            has_remote_committed_next_frame: false,
-            has_committed_frame: false,
-            queued_command: None,
-        }));
+        )));
+
+        let w = game_size.0.to_be_bytes();
+        let h = game_size.1.to_be_bytes();
+        socket.write_all(&w).unwrap();
+        socket.write_all(&h).unwrap();
+
         Self { socket, session }
+    }
+
+    pub fn join(
+        mut socket: TcpStream,
+        local_player: PlayerIndex,
+        remote_player: PlayerIndex,
+        player_direction: Direction,
+        frame: u32,
+    ) -> (Self, (u16, u16)) {
+        let session = Arc::new(Mutex::new(Session::new(
+            local_player,
+            remote_player,
+            player_direction,
+            frame,
+        )));
+
+        let mut w_buf = [0; 2];
+        socket.read_exact(&mut w_buf).unwrap();
+        let mut h_buf = [0; 2];
+        socket.read_exact(&mut h_buf).unwrap();
+        let game_size = (u16::from_be_bytes(w_buf), u16::from_be_bytes(h_buf));
+
+        (Self { socket, session }, game_size)
     }
 
     pub fn start_game(&mut self, sender: Sender<ThreadMessage>, slow_io: bool) -> NetResult<()> {
@@ -115,6 +140,25 @@ struct Session {
 }
 
 impl Session {
+    fn new(
+        local_player: PlayerIndex,
+        remote_player: PlayerIndex,
+        player_direction: Direction,
+        frame: u32,
+    ) -> Self {
+        Self {
+            player: local_player,
+            remote_player,
+            player_direction,
+            frame,
+            queued_command_from_remote: None,
+            has_remote_committed_frame: false,
+            has_remote_committed_next_frame: false,
+            has_committed_frame: false,
+            queued_command: None,
+        }
+    }
+
     fn start_game(&mut self) -> OutgoingPacket {
         OutgoingPacket(NetworkPacket::SetDirection(SetDirectionPacket::new(
             self.frame,
@@ -320,6 +364,7 @@ fn run_socket_reader(
     }
 }
 
+#[derive(Debug)]
 pub enum NetworkEvent {
     SetDirectionCommand(SetDirectionCommand),
     RemoteLeft { politely: bool },
