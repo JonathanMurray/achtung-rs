@@ -1,20 +1,22 @@
-use anyhow::Result;
+mod user_interface;
 
-use crossterm::cursor::{Hide, MoveTo};
-use crossterm::event::Event::Key;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::{Color, ResetColor, SetForegroundColor};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::QueueableCommand;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::io::{self, Stdout, Write};
+use std::io::{self};
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::{panic, thread};
 
-type Point = (u16, u16);
+use anyhow::Result;
+use crossterm::event::Event::Key;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::style::Color;
+use crossterm::terminal::{self};
+
+use user_interface::TerminalUi;
+
+pub type Point = (u16, u16);
 type Direction = (i32, i32);
 
 const UP: Direction = (0, -1);
@@ -27,7 +29,7 @@ const DIRECTIONS: [Direction; 4] = [UP, LEFT, DOWN, RIGHT];
 fn main() -> Result<()> {
     panic::set_hook(Box::new(move |panic_info| {
         let mut stdout = io::stdout();
-        restore_terminal(&mut stdout);
+        user_interface::restore_terminal(&mut stdout);
         eprintln!("Panic: >{:?}<", panic_info);
     }));
 
@@ -40,18 +42,19 @@ fn main() -> Result<()> {
 struct App {
     size: (u16, u16),
     game_over: bool,
-    stdout: Stdout,
-    banner: String,
+    ui: TerminalUi,
     players: Vec<Player>,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
-        let mut stdout = io::stdout();
-        claim_terminal(&mut stdout)?;
         let (terminal_w, terminal_h) = terminal::size()?;
         let w = min(25, terminal_w);
         let h = max(terminal_h, 10);
+        let size = (w, h);
+        let mut ui = TerminalUi::new(size)?;
+
+        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", size));
 
         let arrow_controls =
             KeyboardControls::new([KeyCode::Up, KeyCode::Left, KeyCode::Down, KeyCode::Right]);
@@ -66,10 +69,9 @@ impl App {
         let top = ((w / 2, 1), DOWN);
         let bot = ((w / 2, h - 2), UP);
         Ok(Self {
-            size: (w, h),
+            size,
             game_over: false,
-            stdout,
-            banner: format!("ACHTUNG! {:?}", (w, h)),
+            ui,
             players: vec![
                 Player::new(
                     "P1".to_string(),
@@ -95,18 +97,13 @@ impl App {
         Self::spawn_event_receiver(sender);
 
         loop {
-            self.draw_border()?;
+            self.ui.draw_background()?;
 
             for player in &self.players {
-                self.stdout.queue(SetForegroundColor(player.color))?;
-                for point in &player.line {
-                    self.stdout.queue(MoveTo(point.0, point.1))?;
-                    self.stdout.write_all("X".as_bytes())?;
-                }
+                self.ui.draw_colored_line(player.color, &player.line)?;
             }
-            self.stdout.queue(ResetColor)?;
 
-            self.stdout.flush()?;
+            self.ui.flush()?;
 
             match receiver.recv()? {
                 Message::Event(event) => match event {
@@ -147,20 +144,25 @@ impl App {
                         }
 
                         for i in 0..self.players.len() {
-                            if self.is_crashing(i) {
+                            if !self.players[i].crashed && self.is_player_crashing(i) {
                                 self.players[i].crashed = true;
-                                self.banner = format!("{} crashed!", self.players[i].name);
+                                self.ui.set_banner(
+                                    Color::Yellow,
+                                    format!("{} crashed!", self.players[i].name),
+                                );
                             }
                         }
 
                         let mut survivors = self.players.iter().filter(|p| !p.crashed);
                         if let Some(survivor) = survivors.next() {
                             if survivors.next().is_none() {
-                                self.banner = format!("{} won!", survivor.name);
+                                self.ui
+                                    .set_banner(survivor.color, format!("{} won!", survivor.name));
                                 self.game_over = true;
                             }
                         } else {
-                            self.banner = "Everyone crashed!".to_string();
+                            self.ui
+                                .set_banner(Color::Yellow, "Everyone crashed!".to_string());
                             self.game_over = true;
                         }
 
@@ -210,7 +212,7 @@ impl App {
         });
     }
 
-    fn is_crashing(&self, player_index: usize) -> bool {
+    fn is_player_crashing(&self, player_index: usize) -> bool {
         let head = self.players[player_index].head();
         if !self.is_within_game_bounds(head) {
             return true;
@@ -244,47 +246,6 @@ impl App {
 
     fn is_within_game_bounds(&self, point: Point) -> bool {
         point.0 > 0 && point.1 > 0 && point.0 < self.size.0 - 1 && point.1 < self.size.1 - 1
-    }
-
-    fn draw_border(&mut self) -> Result<()> {
-        let (w, h) = self.size;
-        self.stdout.queue(MoveTo(0, 0))?;
-
-        for y in 0..h {
-            if y == 0 {
-                let banner = &self.banner[0..min(w as usize - 6, self.banner.len())];
-                self.stdout.write_all("+-- ".as_bytes())?;
-                self.stdout.queue(SetForegroundColor(Color::Yellow))?;
-                self.stdout.write_all(format!("{} ", banner).as_bytes())?;
-                self.stdout.queue(ResetColor)?;
-                self.stdout.write_all(
-                    "-".repeat((w - 6 - banner.len() as u16) as usize)
-                        .as_bytes(),
-                )?;
-                self.stdout.write_all("+".as_bytes())?;
-            } else if y == h - 1 {
-                self.stdout.write_all("+-- press q to exit ".as_bytes())?;
-                self.stdout
-                    .write_all("-".repeat((w - 21) as usize).as_bytes())?;
-                self.stdout.write_all("+".as_bytes())?;
-            } else {
-                self.stdout.write_all("|".as_bytes())?;
-                self.stdout
-                    .write_all(" ".repeat((w - 2) as usize).as_bytes())?;
-                self.stdout.write_all("|".as_bytes())?;
-            }
-            if y < h - 1 {
-                self.stdout.write_all("\n".as_bytes())?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        restore_terminal(&mut self.stdout);
     }
 }
 
@@ -369,18 +330,4 @@ impl KeyboardControls {
     fn handle(&self, pressed_key_code: KeyCode) -> Option<Direction> {
         self.map.get(&pressed_key_code).copied()
     }
-}
-
-fn claim_terminal(stdout: &mut Stdout) -> Result<()> {
-    terminal::enable_raw_mode()?;
-    stdout.queue(EnterAlternateScreen)?;
-    stdout.queue(Hide)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn restore_terminal(stdout: &mut Stdout) {
-    stdout.queue(LeaveAlternateScreen).unwrap();
-    stdout.flush().unwrap();
-    terminal::disable_raw_mode().unwrap();
 }
