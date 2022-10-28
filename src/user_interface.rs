@@ -13,10 +13,11 @@ pub struct TerminalUi {
     size: (u16, u16),
     banner: String,
     banner_color: Color,
+    frame: String,
 }
 
 impl TerminalUi {
-    pub fn new(size: (u16, u16)) -> Result<Self> {
+    pub fn new(size: (u16, u16), frame: u32) -> Result<Self> {
         let mut stdout = io::stdout();
         claim_terminal(&mut stdout)?;
 
@@ -25,6 +26,7 @@ impl TerminalUi {
             size,
             banner: String::new(),
             banner_color: Color::White,
+            frame: format!("{}", frame),
         })
     }
 
@@ -45,9 +47,10 @@ impl TerminalUi {
                 )?;
                 self.stdout.write_all("+".as_bytes())?;
             } else if y == h - 1 {
-                self.stdout.write_all("+-- press q to exit ".as_bytes())?;
                 self.stdout
-                    .write_all("-".repeat((w - 21) as usize).as_bytes())?;
+                    .write_all(format!("+-- {} ", self.frame).as_bytes())?;
+                self.stdout
+                    .write_all("-".repeat(w as usize - self.frame.len() - 6).as_bytes())?;
                 self.stdout.write_all("+".as_bytes())?;
             } else {
                 self.stdout.write_all("|".as_bytes())?;
@@ -86,6 +89,10 @@ impl TerminalUi {
         self.stdout.queue(ResetColor)?;
         self.stdout.flush()?;
         Ok(())
+    }
+
+    pub fn set_frame(&mut self, frame: u32) {
+        self.frame = format!("{}", frame);
     }
 }
 

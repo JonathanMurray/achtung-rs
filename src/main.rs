@@ -1,3 +1,4 @@
+mod app;
 mod game;
 mod user_interface;
 
@@ -6,9 +7,9 @@ use std::net::{TcpListener, TcpStream};
 use std::{env, panic};
 
 use anyhow::Result;
-use game::Game;
+use app::App;
 
-use crate::game::GameMode;
+use crate::app::GameMode;
 use user_interface::TerminalUi;
 
 pub type Point = (u16, u16);
@@ -40,8 +41,8 @@ fn main() -> Result<()> {
 
     setup_panic_handler();
 
-    let mut game = Game::new(mode)?;
-    game.run()?;
+    let mut app = App::new(mode)?;
+    app.run()?;
 
     Ok(())
 }
