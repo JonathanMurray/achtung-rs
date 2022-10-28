@@ -1,7 +1,7 @@
 use crate::game::{
     Direction, FrameReport, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
 };
-use crate::net::{NetError, NetworkEvent, NetworkPacket, Networking};
+use crate::net::{EventOutcome, NetError, NetworkEvent, Networking};
 use crate::{game, TerminalUi};
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -61,20 +61,34 @@ impl App {
 
         match mode {
             GameMode::Host(socket) => {
-                players = vec![
-                    Player::new("P1".to_string(), Color::Blue, west),
-                    Player::new("P2".to_string(), Color::Green, east),
-                ];
-                players_controlled_by_keyboard.push((wasd_controls, 0));
-                networking = Some(Networking::new(socket, 0, 1));
+                let local_player = Player::new("P1".to_string(), Color::Blue, west);
+                let remote_player = Player::new("P2".to_string(), Color::Green, east);
+                let local_player_i = 0;
+                let remote_player_i = 1;
+                players_controlled_by_keyboard.push((wasd_controls, local_player_i));
+                networking = Some(Networking::new(
+                    socket,
+                    local_player_i,
+                    remote_player_i,
+                    local_player.direction,
+                    frame,
+                ));
+                players = vec![local_player, remote_player];
             }
             GameMode::Client(socket) => {
-                players = vec![
-                    Player::new("P1".to_string(), Color::Blue, west),
-                    Player::new("P2".to_string(), Color::Green, east),
-                ];
-                players_controlled_by_keyboard.push((wasd_controls, 1));
-                networking = Some(Networking::new(socket, 1, 0));
+                let remote_player = Player::new("P1".to_string(), Color::Blue, west);
+                let local_player = Player::new("P2".to_string(), Color::Green, east);
+                let remote_player_i = 0;
+                let local_player_i = 1;
+                players_controlled_by_keyboard.push((wasd_controls, local_player_i));
+                networking = Some(Networking::new(
+                    socket,
+                    local_player_i,
+                    remote_player_i,
+                    local_player.direction,
+                    frame,
+                ));
+                players = vec![remote_player, local_player];
             }
             GameMode::Offline => {
                 players = vec![
@@ -108,17 +122,10 @@ impl App {
         Self::spawn_event_receiver(sender.clone());
 
         if let Some(networking) = &mut self.networking {
-            assert_eq!(self.players_controlled_by_keyboard.len(), 1);
-            let (_controls, player_i) = &self.players_controlled_by_keyboard[0];
-            let frame = self.game.frame;
-            let direction = self.game.players[*player_i].direction;
             networking
                 .spawn_socket_reader(sender, slow_io)
                 .expect("Spawning socket reader");
-            let commands = networking
-                .start_new_frame(frame, direction)
-                .expect("Starting first frame");
-            assert!(commands.is_empty());
+            networking.start_game().expect("Starting game");
         }
 
         let mut even_tick = true;
@@ -158,7 +165,7 @@ impl App {
                                     let mut execute_now = true;
 
                                     if let Some(networking) = &mut self.networking {
-                                        match networking.set_direction(self.game.frame, dir) {
+                                        match networking.set_direction(dir) {
                                             Ok(x) => execute_now = x,
                                             Err(error) => self.handle_networking_error(error),
                                         }
@@ -174,35 +181,25 @@ impl App {
                     _ => {}
                 },
 
-                ThreadMessage::Network(network_event) => match network_event {
-                    // TODO: Let networking module handle more of this
-                    NetworkEvent::Received(packet) => match packet {
-                        NetworkPacket::SetDirection(cmd) => {
-                            let networking = self.networking.as_mut().unwrap();
-                            if let Some((player_i, direction)) =
-                                networking.receive_command(cmd, self.game.frame)
-                            {
-                                self.game.players[player_i].direction = direction;
-                            }
+                ThreadMessage::Network(network_event) => {
+                    let networking = self.networking.as_mut().unwrap();
+
+                    match networking.handle_event(network_event) {
+                        EventOutcome::SetDirection(cmd) => {
+                            self.game.players[cmd.player_i].direction = cmd.direction;
                         }
-                        NetworkPacket::CommitFrame(frame_modulo) => {
-                            let networking = self.networking.as_mut().unwrap();
-                            networking.receive_commit(frame_modulo, self.game.frame);
-                        }
-                        NetworkPacket::GoodBye => {
-                            self.ui.set_banner(Color::Yellow, "They left!".to_string());
+                        EventOutcome::TheyLeft { politely } => {
+                            let msg = if politely {
+                                "They left!"
+                            } else {
+                                "Disconnected!"
+                            };
+                            self.ui.set_banner(Color::Yellow, msg.to_string());
                             self.game.game_over = true;
                         }
-                    },
-                    NetworkEvent::Error(e) => {
-                        panic!("NetworkEvent::Error({:?})", e);
+                        EventOutcome::None => {}
                     }
-                    NetworkEvent::RemoteDisconnected => {
-                        self.ui
-                            .set_banner(Color::Yellow, "Disconnected!".to_string());
-                        self.game.game_over = true;
-                    }
-                },
+                }
 
                 ThreadMessage::Tick => {
                     even_tick = !even_tick;
@@ -210,7 +207,7 @@ impl App {
                     if even_tick {
                         if let Some(networking) = self.networking.as_mut() {
                             if !self.game.game_over {
-                                if let Err(e) = networking.commit_frame(self.game.frame) {
+                                if let Err(e) = networking.commit_frame() {
                                     self.handle_networking_error(e);
                                 }
                             }
@@ -252,14 +249,11 @@ impl App {
                             self.ui.set_frame(self.game.frame);
 
                             if let Some(networking) = &mut self.networking {
-                                assert_eq!(self.players_controlled_by_keyboard.len(), 1);
-                                let local_player_i = self.players_controlled_by_keyboard[0].1;
-                                let local_direction = self.game.players[local_player_i].direction;
-
-                                match networking.start_new_frame(self.game.frame, local_direction) {
+                                match networking.start_new_frame(self.game.frame) {
                                     Ok(commands) => {
-                                        for (player_i, direction) in commands {
-                                            self.game.players[player_i].direction = direction;
+                                        for cmd in commands {
+                                            self.game.players[cmd.player_i].direction =
+                                                cmd.direction;
                                         }
                                     }
                                     Err(error) => {
