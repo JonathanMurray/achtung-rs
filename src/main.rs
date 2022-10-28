@@ -7,11 +7,22 @@ use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::QueueableCommand;
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::io::{self, Stdout, Write};
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::{panic, thread};
+
+type Point = (u16, u16);
+type Direction = (i32, i32);
+
+const UP: Direction = (0, -1);
+const LEFT: Direction = (-1, 0);
+const DOWN: Direction = (0, 1);
+const RIGHT: Direction = (1, 0);
+
+const DIRECTIONS: [Direction; 4] = [UP, LEFT, DOWN, RIGHT];
 
 fn main() -> Result<()> {
     panic::set_hook(Box::new(move |panic_info| {
@@ -31,8 +42,7 @@ struct App {
     game_over: bool,
     stdout: Stdout,
     banner: String,
-    human: Player,
-    ai: Player,
+    players: Vec<Player>,
 }
 
 impl App {
@@ -40,16 +50,42 @@ impl App {
         let mut stdout = io::stdout();
         claim_terminal(&mut stdout)?;
         let (terminal_w, terminal_h) = terminal::size()?;
-        let w = min(30, terminal_w);
+        let w = min(25, terminal_w);
         let h = max(terminal_h, 10);
 
+        let arrow_controls =
+            KeyboardControls::new([KeyCode::Up, KeyCode::Left, KeyCode::Down, KeyCode::Right]);
+        let wasd_controls = KeyboardControls::new([
+            KeyCode::Char('w'),
+            KeyCode::Char('a'),
+            KeyCode::Char('s'),
+            KeyCode::Char('d'),
+        ]);
+        let east = ((w - 2, h / 2), LEFT);
+        let west = ((1, h / 2), RIGHT);
+        let top = ((w / 2, 1), DOWN);
+        let bot = ((w / 2, h - 2), UP);
         Ok(Self {
             size: (w, h),
             game_over: false,
             stdout,
-            banner: "ACHTUNG!".to_string(),
-            human: Player::new((1, h / 2), (1, 0)),
-            ai: Player::new((w - 2, h / 2), (-1, 0)),
+            banner: format!("ACHTUNG! {:?}", (w, h)),
+            players: vec![
+                Player::new(
+                    "P1".to_string(),
+                    Color::Blue,
+                    PlayerControls::Keyboard(wasd_controls),
+                    west,
+                ),
+                Player::new(
+                    "P2".to_string(),
+                    Color::Green,
+                    PlayerControls::Keyboard(arrow_controls),
+                    east,
+                ),
+                Player::new("AI 1".to_string(), Color::Red, PlayerControls::Ai, top),
+                Player::new("AI 2".to_string(), Color::Cyan, PlayerControls::Ai, bot),
+            ],
         })
     }
 
@@ -61,15 +97,12 @@ impl App {
         loop {
             self.draw_border()?;
 
-            self.stdout.queue(SetForegroundColor(Color::Blue))?;
-            for point in &self.human.line {
-                self.stdout.queue(MoveTo(point.0, point.1))?;
-                self.stdout.write_all("X".as_bytes())?;
-            }
-            self.stdout.queue(SetForegroundColor(Color::Red))?;
-            for point in &self.ai.line {
-                self.stdout.queue(MoveTo(point.0, point.1))?;
-                self.stdout.write_all("X".as_bytes())?;
+            for player in &self.players {
+                self.stdout.queue(SetForegroundColor(player.color))?;
+                for point in &player.line {
+                    self.stdout.queue(MoveTo(point.0, point.1))?;
+                    self.stdout.write_all("X".as_bytes())?;
+                }
             }
             self.stdout.queue(ResetColor)?;
 
@@ -91,30 +124,50 @@ impl App {
                         code,
                         kind: KeyEventKind::Press,
                         ..
-                    }) if key_direction(code).is_some() => {
-                        self.human.direction = key_direction(code).unwrap();
+                    }) => {
+                        for player in &mut self.players {
+                            if !player.crashed {
+                                if let PlayerControls::Keyboard(controls) = &player.controls {
+                                    if let Some(dir) = controls.handle(code) {
+                                        player.direction = dir;
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 },
 
                 Message::Tick => {
-                    if self.game_over {
-                        continue;
-                    } else if !self.is_vacant(self.human.next_position()) {
-                        self.game_over = true;
-                        self.banner = "YOU LOST!".to_string();
-                    } else if !self.is_vacant(self.ai.next_position()) {
-                        self.game_over = true;
-                        self.banner = "YOU WON!".to_string();
-                    } else {
-                        self.human.advance_one_step();
-                        self.ai.advance_one_step();
+                    if !self.game_over {
+                        for player in &mut self.players {
+                            if !player.crashed {
+                                player.advance_one_step();
+                            }
+                        }
 
-                        let ai_head = self.ai.head();
-                        if !self.is_vacant(translated(ai_head, self.ai.direction)) {
-                            for dir in [(1, 0), (0, 1), (-1, 0), (0, -1)] {
-                                if self.is_vacant(translated(ai_head, dir)) {
-                                    self.ai.direction = dir;
+                        for i in 0..self.players.len() {
+                            if self.is_crashing(i) {
+                                self.players[i].crashed = true;
+                                self.banner = format!("{} crashed!", self.players[i].name);
+                            }
+                        }
+
+                        let mut survivors = self.players.iter().filter(|p| !p.crashed);
+                        if let Some(survivor) = survivors.next() {
+                            if survivors.next().is_none() {
+                                self.banner = format!("{} won!", survivor.name);
+                                self.game_over = true;
+                            }
+                        } else {
+                            self.banner = "Everyone crashed!".to_string();
+                            self.game_over = true;
+                        }
+
+                        for i in 0..self.players.len() {
+                            if !self.players[i].crashed {
+                                if let PlayerControls::Ai = &self.players[i].controls {
+                                    self.run_player_ai(i)
                                 }
                             }
                         }
@@ -124,6 +177,17 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn run_player_ai(&mut self, player_index: usize) {
+        let ai_head = self.players[player_index].head();
+        if !self.is_vacant(translated(ai_head, self.players[player_index].direction)) {
+            for dir in DIRECTIONS {
+                if self.is_vacant(translated(ai_head, dir)) {
+                    self.players[player_index].direction = dir;
+                }
+            }
+        }
     }
 
     fn spawn_periodic_timer(sender: Sender<Message>) {
@@ -146,11 +210,39 @@ impl App {
         });
     }
 
-    fn is_vacant(&self, point: (u16, u16)) -> bool {
-        self.is_within_game_bounds(point) && !self.human.contains(point) && !self.ai.contains(point)
+    fn is_crashing(&self, player_index: usize) -> bool {
+        let head = self.players[player_index].head();
+        if !self.is_within_game_bounds(head) {
+            return true;
+        }
+
+        for (i, player) in self.players.iter().enumerate() {
+            let obstacle = if i == player_index {
+                // A player can not be crashing with its own head
+                player.tail()
+            } else {
+                player.full_body()
+            };
+            if obstacle.contains(&head) {
+                return true;
+            }
+        }
+        false
     }
 
-    fn is_within_game_bounds(&self, point: (u16, u16)) -> bool {
+    fn is_vacant(&self, point: Point) -> bool {
+        if !self.is_within_game_bounds(point) {
+            return false;
+        }
+        for player in &self.players {
+            if player.full_body().contains(&point) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_within_game_bounds(&self, point: Point) -> bool {
         point.0 > 0 && point.1 > 0 && point.0 < self.size.0 - 1 && point.1 < self.size.1 - 1
     }
 
@@ -197,15 +289,33 @@ impl Drop for App {
 }
 
 struct Player {
-    line: Vec<(u16, u16)>,
-    direction: (i32, i32),
+    name: String,
+    color: Color,
+    controls: PlayerControls,
+    line: Vec<Point>,
+    direction: Direction,
+    crashed: bool,
+}
+
+enum PlayerControls {
+    Keyboard(KeyboardControls),
+    Ai,
 }
 
 impl Player {
-    fn new(pos: (u16, u16), direction: (i32, i32)) -> Self {
+    fn new(
+        name: String,
+        color: Color,
+        controls: PlayerControls,
+        start_position: (Point, Direction),
+    ) -> Self {
         Self {
-            line: vec![pos],
-            direction,
+            name,
+            color,
+            controls,
+            line: vec![start_position.0],
+            direction: start_position.1,
+            crashed: false,
         }
     }
 
@@ -213,23 +323,27 @@ impl Player {
         self.line.push(self.next_position());
     }
 
-    fn next_position(&self) -> (u16, u16) {
+    fn next_position(&self) -> Point {
         translated(self.head(), self.direction)
     }
 
-    fn head(&self) -> (u16, u16) {
+    fn head(&self) -> Point {
         *self.line.last().unwrap()
     }
 
-    fn contains(&self, point: (u16, u16)) -> bool {
-        self.line.contains(&point)
+    fn full_body(&self) -> &[Point] {
+        &self.line[..]
+    }
+
+    fn tail(&self) -> &[Point] {
+        &self.line[..self.line.len() - 1]
     }
 }
 
-fn translated(pos: (u16, u16), direction: (i32, i32)) -> (u16, u16) {
+fn translated(point: Point, direction: Direction) -> Point {
     (
-        (pos.0 as i32 + direction.0) as u16,
-        (pos.1 as i32 + direction.1) as u16,
+        (point.0 as i32 + direction.0) as u16,
+        (point.1 as i32 + direction.1) as u16,
     )
 }
 
@@ -238,13 +352,22 @@ enum Message {
     Tick,
 }
 
-fn key_direction(pressed_key_code: KeyCode) -> Option<(i32, i32)> {
-    match pressed_key_code {
-        KeyCode::Left => Some((-1, 0)),
-        KeyCode::Right => Some((1, 0)),
-        KeyCode::Up => Some((0, -1)),
-        KeyCode::Down => Some((0, 1)),
-        _ => None,
+struct KeyboardControls {
+    map: HashMap<KeyCode, Direction>,
+}
+
+impl KeyboardControls {
+    fn new(direction_keys: [KeyCode; 4]) -> Self {
+        let mut map = HashMap::new();
+        map.insert(direction_keys[0], UP);
+        map.insert(direction_keys[1], LEFT);
+        map.insert(direction_keys[2], DOWN);
+        map.insert(direction_keys[3], RIGHT);
+        Self { map }
+    }
+
+    fn handle(&self, pressed_key_code: KeyCode) -> Option<Direction> {
+        self.map.get(&pressed_key_code).copied()
     }
 }
 
