@@ -1,4 +1,7 @@
-use crate::game::{Direction, FrameReport, Game, Player, DIRECTIONS, DOWN, LEFT, RIGHT, UP};
+use crate::game::{
+    Direction, FrameReport, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
+};
+use crate::net::{NetworkEvent, NetworkPacket, Networking};
 use crate::{game, TerminalUi};
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -6,7 +9,6 @@ use crossterm::style::Color;
 use crossterm::terminal;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
@@ -22,13 +24,10 @@ pub enum GameMode {
 
 pub struct App {
     game: Game,
-    socket: Option<TcpStream>,
     ui: TerminalUi,
-    ready_to_run_frame: bool,
-    received_commands_for_next_frame: Vec<SetDirection>,
-    players_controlled_by_keyboard: Vec<(KeyboardControls, usize)>,
-    players_controlled_by_ai: Vec<usize>,
-    player_controlled_by_socket: Option<usize>, // TODO combine with socket field somehow
+    networking: Option<Networking>,
+    players_controlled_by_keyboard: Vec<(KeyboardControls, PlayerIndex)>,
+    players_controlled_by_ai: Vec<PlayerIndex>,
 }
 
 impl App {
@@ -55,26 +54,26 @@ impl App {
         let top = ((w / 2, 1), DOWN);
         let bot = ((w / 2, h - 2), UP);
 
+        let networking;
         let players;
         let mut players_controlled_by_keyboard = vec![];
-        let mut player_controlled_by_socket = None;
         let mut players_controlled_by_ai = vec![];
 
         match mode {
-            GameMode::Host(_) => {
+            GameMode::Host(socket) => {
                 players = vec![
                     Player::new("P1".to_string(), Color::Blue, west),
                     Player::new("P2".to_string(), Color::Green, east),
                 ];
                 players_controlled_by_keyboard.push((wasd_controls, 0));
-                player_controlled_by_socket = Some(1);
+                networking = Some(Networking::new(socket, 1));
             }
-            GameMode::Client(_) => {
+            GameMode::Client(socket) => {
                 players = vec![
                     Player::new("P1".to_string(), Color::Blue, west),
                     Player::new("P2".to_string(), Color::Green, east),
                 ];
-                player_controlled_by_socket = Some(0);
+                networking = Some(Networking::new(socket, 0));
                 players_controlled_by_keyboard.push((wasd_controls, 1));
             }
             GameMode::Offline => {
@@ -88,49 +87,33 @@ impl App {
                 players_controlled_by_keyboard.push((arrow_controls, 1));
                 players_controlled_by_ai.push(2);
                 players_controlled_by_ai.push(3);
+                networking = None;
             }
         };
-
-        let socket = match mode {
-            GameMode::Host(socket) => Some(socket),
-            GameMode::Client(socket) => Some(socket),
-            GameMode::Offline => None,
-        };
-
-        let offline = socket.is_none();
 
         let game = Game::new(size, players, frame);
 
         Ok(Self {
             game,
-            socket,
+            networking,
             ui,
-            ready_to_run_frame: offline,
-            received_commands_for_next_frame: vec![],
             players_controlled_by_keyboard,
             players_controlled_by_ai,
-            player_controlled_by_socket,
         })
     }
 
-    pub fn run(&mut self) -> anyhow::Result<()> {
+    pub fn run(&mut self, slow_io: bool) -> anyhow::Result<()> {
         let (sender, receiver) = mpsc::channel();
         Self::spawn_periodic_timer(sender.clone());
         Self::spawn_event_receiver(sender.clone());
 
-        if let Some(socket) = &self.socket {
-            let socket = socket.try_clone()?;
-            Self::spawn_socket_reader(sender, socket.try_clone()?);
-
-            let mut socket = socket.try_clone()?;
+        if let Some(networking) = &mut self.networking {
             assert_eq!(self.players_controlled_by_keyboard.len(), 1);
             let (_controls, player_i) = &self.players_controlled_by_keyboard[0];
-
-            send_direction_command(
-                &mut socket,
-                self.game.frame,
-                self.game.players[*player_i].direction,
-            )?;
+            let frame = self.game.frame;
+            let direction = self.game.players[*player_i].direction;
+            networking.spawn_socket_reader(sender, slow_io)?;
+            networking.on_start_of_frame(frame, direction)?;
         }
 
         loop {
@@ -164,8 +147,8 @@ impl App {
                             if !player.crashed {
                                 if let Some(dir) = controls.handle(code) {
                                     player.direction = dir;
-                                    if let Some(socket) = &mut self.socket {
-                                        send_direction_command(socket, self.game.frame, dir)?;
+                                    if let Some(networking) = &mut self.networking {
+                                        networking.send_direction_command(self.game.frame, dir)?;
                                     }
                                 }
                             }
@@ -177,17 +160,11 @@ impl App {
                 ThreadMessage::Network(network_event) => match network_event {
                     NetworkEvent::Received(packet) => match packet {
                         NetworkPacket::Command(cmd) => {
-                            if cmd.frame_modulo == SetDirection::modulo(self.game.frame - 1) {
-                                // Too late. That frame has already been run.
-                            } else if cmd.frame_modulo == SetDirection::modulo(self.game.frame) {
-                                self.ready_to_run_frame = true;
-                                let player_i = self.player_controlled_by_socket.unwrap();
-                                self.game.players[player_i].direction = cmd.direction;
-                            } else if cmd.frame_modulo == SetDirection::modulo(self.game.frame + 1)
+                            let networking = self.networking.as_mut().unwrap();
+                            if let Some((player_i, direction)) =
+                                networking.handle_received_command(cmd, self.game.frame)
                             {
-                                self.received_commands_for_next_frame.push(cmd);
-                            } else {
-                                panic!("Received network packet with unexpected frame modulo: {:?}. Our frame: {}", packet, self.game.frame);
+                                self.game.players[player_i].direction = direction;
                             }
                         }
                         NetworkPacket::GoodBye => {
@@ -206,7 +183,12 @@ impl App {
                 },
 
                 ThreadMessage::Tick => {
-                    if self.ready_to_run_frame && !self.game.game_over {
+                    let ready = self
+                        .networking
+                        .as_ref()
+                        .map(|networking| networking.ready_to_run_frame)
+                        .unwrap_or(true);
+                    if ready && !self.game.game_over {
                         if let Some(report) = self.game.run_frame() {
                             match report {
                                 FrameReport::PlayerCrashed(i) => {
@@ -232,51 +214,33 @@ impl App {
                             }
                         }
 
-                        // If online, wait for others' input before next frame
-                        self.ready_to_run_frame = self.socket.is_none();
                         self.ui.set_frame(self.game.frame);
 
-                        if let Some(command) = self.received_commands_for_next_frame.last() {
-                            assert_eq!(SetDirection::modulo(self.game.frame), command.frame_modulo);
-                            let player_i = self.player_controlled_by_socket.unwrap();
-                            self.game.players[player_i].direction = command.direction;
-                            self.received_commands_for_next_frame.clear();
-                            self.ready_to_run_frame = true;
-                        }
-
-                        if let Some(socket) = &mut self.socket {
+                        if let Some(networking) = &mut self.networking {
                             assert_eq!(self.players_controlled_by_keyboard.len(), 1);
-                            let player_i = self.players_controlled_by_keyboard[0].1;
+                            let local_player_i = self.players_controlled_by_keyboard[0].1;
+                            let local_player_direction =
+                                self.game.players[local_player_i].direction;
 
-                            // Send out a direction message for the next frame.
-                            // This tells the remote that we're ready for it
-                            // TODO: what if remote is further ahead and they immediately
-                            // execute the next frame, meaning that we never got a chance
-                            // to control our line?
-                            send_direction_command(
-                                socket,
-                                self.game.frame,
-                                self.game.players[player_i].direction,
-                            )?;
+                            if let Some((remote_player_i, remote_direction)) = networking
+                                .on_start_of_frame(self.game.frame, local_player_direction)?
+                            {
+                                self.game.players[remote_player_i].direction = remote_direction;
+                            }
                         }
                     }
                 }
             }
         }
 
-        if let Some(socket) = &mut self.socket {
-            if let Err(error) = send_net_packet(socket, NetworkPacket::GoodBye) {
-                match error.kind() {
-                    ErrorKind::ConnectionReset => {}
-                    _ => panic!("Failed to send goodbye: {:?}", error),
-                }
-            }
+        if let Some(networking) = &mut self.networking {
+            networking.on_exit();
         }
 
         Ok(())
     }
 
-    fn run_player_ai(&mut self, player_index: usize) {
+    fn run_player_ai(&mut self, player_index: PlayerIndex) {
         let ai_head = self.game.players[player_index].head();
         if !self.game.is_vacant(game::translated(
             ai_head,
@@ -288,59 +252,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn spawn_socket_reader(sender: Sender<ThreadMessage>, mut socket: TcpStream) {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut read_buf = [0; 1024];
-            loop {
-                match socket.read(&mut read_buf) {
-                    Ok(n) => {
-                        thread::sleep(Duration::from_millis(100)); //TODO
-
-                        buf.extend_from_slice(&read_buf[..n]);
-
-                        for byte in &buf {
-                            let msg = match NetworkPacket::parse(*byte) {
-                                Some(msg) => msg,
-                                None => {
-                                    let msg = ThreadMessage::Network(NetworkEvent::Error(format!(
-                                        "Received bad byte: {:?}",
-                                        byte
-                                    )));
-                                    if sender.send(msg).is_err() {
-                                        // no receiver (i.e. main thread has exited)
-                                    }
-                                    return;
-                                }
-                            };
-
-                            let they_left = matches!(msg, NetworkPacket::GoodBye);
-                            let msg = ThreadMessage::Network(NetworkEvent::Received(msg));
-                            if sender.send(msg).is_err() {
-                                // no receiver (i.e. main thread has exited)
-                                return;
-                            }
-                            if they_left {
-                                return;
-                            }
-                        }
-                        buf.clear();
-                    }
-                    Err(error) => {
-                        let msg = match error.kind() {
-                            ErrorKind::ConnectionReset => NetworkEvent::RemoteDisconnected,
-                            _ => NetworkEvent::Error(format!("Socket error: {:?}", error)),
-                        };
-                        if sender.send(ThreadMessage::Network(msg)).is_err() {
-                            // no receiver (i.e. main thread has exited)
-                        }
-                        return;
-                    }
-                }
-            }
-        });
     }
 
     fn spawn_periodic_timer(sender: Sender<ThreadMessage>) {
@@ -364,102 +275,10 @@ impl App {
     }
 }
 
-fn send_direction_command(
-    socket: &mut TcpStream,
-    frame: u32,
-    direction: Direction,
-) -> std::io::Result<()> {
-    socket.write_all(&[NetworkPacket::Command(SetDirection::new(frame, direction)).serialize()])
-}
-
-fn send_net_packet(socket: &mut TcpStream, packet: NetworkPacket) -> std::io::Result<()> {
-    socket.write_all(&[packet.serialize()])
-}
-
-enum ThreadMessage {
+pub enum ThreadMessage {
     UserInput(Event),
     Network(NetworkEvent),
     Tick,
-}
-
-#[derive(Debug)]
-enum NetworkEvent {
-    Received(NetworkPacket),
-    Error(String),
-    RemoteDisconnected,
-}
-
-#[derive(Debug)]
-enum NetworkPacket {
-    Command(SetDirection),
-    GoodBye,
-}
-
-#[derive(Debug, Copy, Clone)]
-struct SetDirection {
-    frame_modulo: u8,
-    direction: Direction,
-}
-
-impl SetDirection {
-    fn new(frame: u32, direction: Direction) -> Self {
-        Self {
-            frame_modulo: Self::modulo(frame),
-            direction,
-        }
-    }
-
-    fn modulo(frame: u32) -> u8 {
-        (frame % 64) as u8
-    }
-}
-
-impl NetworkPacket {
-    // 00000000 = GoodBye
-    // ______dd = direction
-    //       00 = UP
-    //       01 = LEFT
-    //       10 = DOWN
-    //       11 = RIGHT
-    // ffffff__ = FRAME % 64
-
-    fn parse(byte: u8) -> Option<Self> {
-        if byte == 0 {
-            return Some(NetworkPacket::GoodBye);
-        }
-
-        let frame_modulo = (byte & 0b1111_1100) >> 2;
-        let direction = match byte & 0b11 {
-            0b00 => UP,
-            0b01 => LEFT,
-            0b10 => DOWN,
-            0b11 => RIGHT,
-            _ => return None,
-        };
-        Some(NetworkPacket::Command(SetDirection {
-            frame_modulo,
-            direction,
-        }))
-    }
-
-    fn serialize(&self) -> u8 {
-        match self {
-            NetworkPacket::Command(SetDirection {
-                frame_modulo,
-                direction,
-            }) => {
-                let direction_part = match *direction {
-                    UP => 0b00,
-                    LEFT => 0b01,
-                    DOWN => 0b10,
-                    RIGHT => 0b11,
-                    _ => panic!("Invalid direction: {:?}", direction),
-                };
-                (frame_modulo << 2) | direction_part
-            }
-            NetworkPacket::GoodBye => 0,
-        }
-    }
 }
 
 #[derive(Clone)]

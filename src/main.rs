@@ -1,5 +1,6 @@
 mod app;
 mod game;
+mod net;
 mod user_interface;
 
 use std::io::{self, Write};
@@ -41,8 +42,9 @@ fn main() -> Result<()> {
 
     setup_panic_handler();
 
+    let slow_io = matches!(mode, GameMode::Host(_));
     let mut app = App::new(mode)?;
-    app.run()?;
+    app.run(slow_io)?;
 
     Ok(())
 }

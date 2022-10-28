@@ -1,6 +1,7 @@
 use crate::Point;
 use crossterm::style::Color;
 
+pub type PlayerIndex = usize;
 pub type Direction = (i32, i32);
 
 pub const UP: Direction = (0, -1);
@@ -77,7 +78,7 @@ impl Game {
         true
     }
 
-    fn is_player_crashing(&self, player_index: usize) -> bool {
+    fn is_player_crashing(&self, player_index: PlayerIndex) -> bool {
         let head = self.players[player_index].head();
         if !self.is_within_game_bounds(head) {
             return true;
@@ -99,7 +100,7 @@ impl Game {
 }
 
 pub enum FrameReport {
-    PlayerCrashed(usize),
+    PlayerCrashed(PlayerIndex),
     PlayerWon(Color, String),
     EveryoneCrashed,
 }
