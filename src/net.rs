@@ -1,24 +1,17 @@
-use crate::app::ThreadMessage;
+use crate::app::{SetDirectionCommand, ThreadMessage};
 use crate::game::{Direction, PlayerIndex, DOWN, LEFT, RIGHT, UP};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 pub struct Networking {
     socket: TcpStream,
-    player: PlayerIndex,
-    remote_player: PlayerIndex,
-    player_direction: Direction,
-    frame: u32,
-    queued_command_from_remote: Option<Direction>,
-    has_remote_committed_frame: bool,
-    has_remote_committed_next_frame: bool,
-    has_committed_frame: bool,
-    queued_command: Option<Direction>,
+    session: Arc<Mutex<Session>>,
 }
 
 impl Networking {
@@ -29,8 +22,7 @@ impl Networking {
         player_direction: Direction,
         frame: u32,
     ) -> Self {
-        Self {
-            socket,
+        let session = Arc::new(Mutex::new(Session {
             player: local_player,
             remote_player,
             player_direction,
@@ -40,137 +32,59 @@ impl Networking {
             has_remote_committed_next_frame: false,
             has_committed_frame: false,
             queued_command: None,
-        }
+        }));
+        Self { socket, session }
     }
 
-    pub fn start_game(&mut self) -> NetResult<()> {
-        self.send_direction_command(self.player_direction)
+    pub fn start_game(&mut self, sender: Sender<ThreadMessage>, slow_io: bool) -> NetResult<()> {
+        self.spawn_socket_reader(sender, slow_io)?;
+
+        let outgoing_packet = self.session.lock().unwrap().start_game();
+        self.send_packet(outgoing_packet.0)
     }
 
     pub fn start_new_frame(&mut self, frame: u32) -> NetResult<Vec<SetDirectionCommand>> {
-        let mut commands = vec![];
-
-        self.frame = frame;
-        self.has_committed_frame = false;
-        self.has_remote_committed_frame = false;
-
-        if let Some(dir) = self.queued_command.take() {
-            self.player_direction = dir;
-            commands.push(SetDirectionCommand {
-                player_i: self.player,
-                direction: dir,
-            });
-        }
-        self.send_direction_command(self.player_direction)?;
-
-        if let Some(dir) = self.queued_command_from_remote.take() {
-            commands.push(SetDirectionCommand {
-                player_i: self.remote_player,
-                direction: dir,
-            });
-        }
-
-        if self.has_remote_committed_next_frame {
-            self.has_remote_committed_frame = true;
-            self.has_remote_committed_next_frame = false;
-        }
-
+        let (commands, outgoing_packet) = self.session.lock().unwrap().start_new_frame(frame);
+        self.send_packet(outgoing_packet.0)?;
         Ok(commands)
     }
 
-    pub fn set_direction(&mut self, direction: Direction) -> NetResult<bool> {
-        if self.has_committed_frame {
-            self.queued_command = Some(direction);
-            Ok(false)
+    pub fn set_direction(
+        &mut self,
+        direction: Direction,
+    ) -> NetResult<Option<SetDirectionCommand>> {
+        let outcome = self.session.lock().unwrap().set_direction(direction);
+        if let Some((outgoing_packet, command)) = outcome {
+            self.send_packet(outgoing_packet.0)?;
+            Ok(Some(command))
         } else {
-            self.player_direction = direction;
-            self.send_direction_command(direction)?;
-            Ok(true)
+            Ok(None)
         }
     }
 
     pub fn commit_frame(&mut self) -> NetResult<()> {
-        if !self.has_committed_frame {
-            self.send_net_packet(NetworkPacket::CommitFrame(NetworkPacket::modulo(
-                self.frame,
-            )))?;
+        let outgoing_packet = self.session.lock().unwrap().commit_frame();
+
+        if let Some(packet) = outgoing_packet {
+            self.send_packet(packet.0)?;
         }
-        self.has_committed_frame = true;
         Ok(())
     }
 
-    pub fn handle_event(&mut self, event: NetworkEvent) -> EventOutcome {
-        match event {
-            NetworkEvent::Received(packet) => match packet {
-                NetworkPacket::SetDirection(pkt) => {
-                    if pkt.frame_modulo == NetworkPacket::modulo(self.frame) {
-                        assert!(!self.has_remote_committed_frame);
-                        return EventOutcome::SetDirection(SetDirectionCommand {
-                            player_i: self.remote_player,
-                            direction: pkt.direction,
-                        });
-                    } else if pkt.frame_modulo == NetworkPacket::modulo(self.frame + 1) {
-                        assert!(!self.has_remote_committed_next_frame);
-                        self.queued_command_from_remote = Some(pkt.direction);
-                    } else {
-                        panic!(
-                            "Received command with unexpected frame modulo: {:?}. Our frame: {}",
-                            pkt, self.frame
-                        );
-                    }
-                }
-
-                NetworkPacket::CommitFrame(frame_modulo) => {
-                    if frame_modulo == NetworkPacket::modulo(self.frame) {
-                        self.has_remote_committed_frame = true;
-                    } else if frame_modulo == NetworkPacket::modulo(self.frame + 1) {
-                        self.has_remote_committed_next_frame = true;
-                    } else {
-                        panic!(
-                            "Received commit with unexpected frame modulo: {:?}. Our frame: {}",
-                            frame_modulo, self.frame
-                        );
-                    }
-                }
-
-                NetworkPacket::GoodBye => {
-                    return EventOutcome::TheyLeft { politely: true };
-                }
-            },
-
-            NetworkEvent::ReceiveError(e) => {
-                panic!("Failed to receive from socket: {:?}", e);
-            }
-
-            NetworkEvent::RemoteDisconnected => {
-                return EventOutcome::TheyLeft { politely: false };
-            }
-        }
-        EventOutcome::None
-    }
-
     pub fn have_everyone_committed_frame(&self) -> bool {
-        self.has_committed_frame && self.has_remote_committed_frame
+        let session = self.session.lock().unwrap();
+        session.has_committed_frame && session.has_remote_committed_frame
     }
 
     pub fn exit(&mut self) {
-        match self.send_net_packet(NetworkPacket::GoodBye) {
-            Ok(_) => {}
+        match self.send_packet(NetworkPacket::GoodBye) {
+            Ok(()) => {}
             Err(NetError::Disconnected) => {}
             Err(error) => panic!("Failed to send goodbye: {:?}", error),
         }
     }
 
-    fn send_direction_command(&mut self, direction: Direction) -> NetResult<()> {
-        self.socket
-            .write_all(&[NetworkPacket::SetDirection(SetDirectionPacket::new(
-                self.frame, direction,
-            ))
-            .serialize()])
-            .map_err(NetError::from)
-    }
-
-    fn send_net_packet(&mut self, packet: NetworkPacket) -> NetResult<()> {
+    fn send_packet(&mut self, packet: NetworkPacket) -> NetResult<()> {
         self.socket
             .write_all(&[packet.serialize()])
             .map_err(NetError::from)
@@ -182,10 +96,126 @@ impl Networking {
         slow_io: bool,
     ) -> NetResult<()> {
         let socket = self.socket.try_clone()?;
-        thread::spawn(move || run_socket_reader(socket, sender, slow_io));
+        let session = Arc::clone(&self.session);
+        thread::spawn(move || run_socket_reader(socket, sender, session, slow_io));
         Ok(())
     }
 }
+
+struct Session {
+    player: PlayerIndex,
+    remote_player: PlayerIndex,
+    player_direction: Direction,
+    frame: u32,
+    queued_command_from_remote: Option<Direction>,
+    has_remote_committed_frame: bool,
+    has_remote_committed_next_frame: bool,
+    has_committed_frame: bool,
+    queued_command: Option<Direction>,
+}
+
+impl Session {
+    fn start_game(&mut self) -> OutgoingPacket {
+        OutgoingPacket(NetworkPacket::SetDirection(SetDirectionPacket::new(
+            self.frame,
+            self.player_direction,
+        )))
+    }
+
+    fn start_new_frame(&mut self, frame: u32) -> (Vec<SetDirectionCommand>, OutgoingPacket) {
+        let mut commands = vec![];
+
+        self.frame = frame;
+        self.has_committed_frame = false;
+        self.has_remote_committed_frame = false;
+
+        if let Some(dir) = self.queued_command.take() {
+            self.player_direction = dir;
+            commands.push(SetDirectionCommand::new(self.player, dir));
+        }
+
+        if let Some(dir) = self.queued_command_from_remote.take() {
+            commands.push(SetDirectionCommand::new(self.remote_player, dir));
+        }
+
+        if self.has_remote_committed_next_frame {
+            self.has_remote_committed_frame = true;
+            self.has_remote_committed_next_frame = false;
+        }
+
+        (
+            commands,
+            OutgoingPacket(NetworkPacket::SetDirection(SetDirectionPacket::new(
+                self.frame,
+                self.player_direction,
+            ))),
+        )
+    }
+
+    fn set_direction(
+        &mut self,
+        direction: Direction,
+    ) -> Option<(OutgoingPacket, SetDirectionCommand)> {
+        if self.has_committed_frame {
+            self.queued_command = Some(direction);
+            None
+        } else {
+            self.player_direction = direction;
+            Some((
+                OutgoingPacket(NetworkPacket::SetDirection(SetDirectionPacket::new(
+                    self.frame, direction,
+                ))),
+                SetDirectionCommand::new(self.player, direction),
+            ))
+        }
+    }
+
+    fn commit_frame(&mut self) -> Option<OutgoingPacket> {
+        if !self.has_committed_frame {
+            self.has_committed_frame = true;
+            Some(OutgoingPacket(NetworkPacket::CommitFrame(
+                NetworkPacket::modulo(self.frame),
+            )))
+        } else {
+            None
+        }
+    }
+
+    fn on_received_set_direction(
+        &mut self,
+        pkt: SetDirectionPacket,
+    ) -> Option<SetDirectionCommand> {
+        if pkt.frame_modulo == NetworkPacket::modulo(self.frame) {
+            assert!(!self.has_remote_committed_frame);
+            return Some(SetDirectionCommand::new(self.remote_player, pkt.direction));
+        } else if pkt.frame_modulo == NetworkPacket::modulo(self.frame + 1) {
+            assert!(!self.has_remote_committed_next_frame);
+            self.queued_command_from_remote = Some(pkt.direction);
+        } else {
+            panic!(
+                "Received command with unexpected frame modulo: {:?}. Our frame: {}",
+                pkt, self.frame
+            );
+        }
+
+        None
+    }
+
+    fn on_received_commit_frame(&mut self, frame_modulo: u8) {
+        if frame_modulo == NetworkPacket::modulo(self.frame) {
+            self.has_remote_committed_frame = true;
+        } else if frame_modulo == NetworkPacket::modulo(self.frame + 1) {
+            self.has_remote_committed_next_frame = true;
+        } else {
+            panic!(
+                "Received commit with unexpected frame modulo: {:?}. Our frame: {}",
+                frame_modulo, self.frame
+            );
+        }
+    }
+}
+
+struct OutgoingPacket(NetworkPacket);
 
 type NetResult<T> = Result<T, NetError>;
 
@@ -212,7 +242,12 @@ impl Display for NetError {
 
 impl Error for NetError {}
 
-fn run_socket_reader(mut socket: TcpStream, sender: Sender<ThreadMessage>, slow_io: bool) {
+fn run_socket_reader(
+    mut socket: TcpStream,
+    sender: Sender<ThreadMessage>,
+    session: Arc<Mutex<Session>>,
+    slow_io: bool,
+) {
     let mut buf = Vec::new();
     let mut read_buf = [0; 1024];
     loop {
@@ -225,7 +260,7 @@ fn run_socket_reader(mut socket: TcpStream, sender: Sender<ThreadMessage>, slow_
                 buf.extend_from_slice(&read_buf[..n]);
 
                 for byte in &buf {
-                    let msg = match NetworkPacket::parse(*byte) {
+                    let packet = match NetworkPacket::parse(*byte) {
                         Some(msg) => msg,
                         None => {
                             let msg = ThreadMessage::Network(NetworkEvent::ReceiveError(format!(
@@ -239,11 +274,31 @@ fn run_socket_reader(mut socket: TcpStream, sender: Sender<ThreadMessage>, slow_
                         }
                     };
 
-                    let they_left = matches!(msg, NetworkPacket::GoodBye);
-                    let msg = ThreadMessage::Network(NetworkEvent::Received(msg));
-                    if sender.send(msg).is_err() {
-                        // no receiver (i.e. main thread has exited)
-                        return;
+                    let mut session = session.lock().unwrap();
+
+                    let mut they_left = false;
+
+                    let event = match packet {
+                        NetworkPacket::SetDirection(pkt) => session
+                            .on_received_set_direction(pkt)
+                            .map(NetworkEvent::SetDirectionCommand),
+
+                        NetworkPacket::CommitFrame(frame_modulo) => {
+                            session.on_received_commit_frame(frame_modulo);
+                            None
+                        }
+
+                        NetworkPacket::GoodBye => {
+                            they_left = true;
+                            Some(NetworkEvent::RemoteLeft { politely: true })
+                        }
+                    };
+
+                    if let Some(event) = event {
+                        if sender.send(ThreadMessage::Network(event)).is_err() {
+                            // no receiver (i.e. main thread has exited)
+                            return;
+                        }
                     }
                     if they_left {
                         return;
@@ -252,11 +307,11 @@ fn run_socket_reader(mut socket: TcpStream, sender: Sender<ThreadMessage>, slow_
                 buf.clear();
             }
             Err(error) => {
-                let msg = match error.kind() {
-                    ErrorKind::ConnectionReset => NetworkEvent::RemoteDisconnected,
+                let event = match error.kind() {
+                    ErrorKind::ConnectionReset => NetworkEvent::RemoteLeft { politely: false },
                     _ => NetworkEvent::ReceiveError(format!("Failed to read: {:?}", error)),
                 };
-                if sender.send(ThreadMessage::Network(msg)).is_err() {
+                if sender.send(ThreadMessage::Network(event)).is_err() {
                     // no receiver (i.e. main thread has exited)
                 }
                 return;
@@ -265,33 +320,21 @@ fn run_socket_reader(mut socket: TcpStream, sender: Sender<ThreadMessage>, slow_
     }
 }
 
-pub enum EventOutcome {
-    SetDirection(SetDirectionCommand),
-    TheyLeft { politely: bool },
-    None,
-}
-
-pub struct SetDirectionCommand {
-    pub player_i: PlayerIndex,
-    pub direction: Direction,
-}
-
-#[derive(Debug)]
 pub enum NetworkEvent {
-    Received(NetworkPacket),
+    SetDirectionCommand(SetDirectionCommand),
+    RemoteLeft { politely: bool },
     ReceiveError(String),
-    RemoteDisconnected,
 }
 
-#[derive(Debug)]
-pub enum NetworkPacket {
+#[derive(Debug, Copy, Clone)]
+enum NetworkPacket {
     SetDirection(SetDirectionPacket),
     CommitFrame(u8),
     GoodBye,
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct SetDirectionPacket {
+struct SetDirectionPacket {
     frame_modulo: u8,
     direction: Direction,
 }
@@ -307,7 +350,7 @@ impl SetDirectionPacket {
 
 impl NetworkPacket {
     // 10000000 = GoodBye
-    // 1fffff__ = CommitFrame(frame)
+    // 1fffff11 = CommitFrame(frame)
     // 0fffffdd = SetDirection(frame, direction)
     // 0     00 = UP
     // 0     01 = LEFT
@@ -342,7 +385,7 @@ impl NetworkPacket {
     fn serialize(&self) -> u8 {
         match self {
             NetworkPacket::GoodBye => 0b_1000_0000,
-            NetworkPacket::CommitFrame(frame_modulo) => 0b_1000_0000 | (frame_modulo << 2),
+            NetworkPacket::CommitFrame(frame_modulo) => 0b_1000_0011 | (frame_modulo << 2),
             NetworkPacket::SetDirection(SetDirectionPacket {
                 frame_modulo,
                 direction,

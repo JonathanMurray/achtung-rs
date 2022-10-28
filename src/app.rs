@@ -1,7 +1,7 @@
 use crate::game::{
     Direction, FrameReport, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
 };
-use crate::net::{EventOutcome, NetError, NetworkEvent, Networking};
+use crate::net::{NetError, NetworkEvent, Networking};
 use crate::{game, TerminalUi};
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -123,9 +123,8 @@ impl App {
 
         if let Some(networking) = &mut self.networking {
             networking
-                .spawn_socket_reader(sender, slow_io)
-                .expect("Spawning socket reader");
-            networking.start_game().expect("Starting game");
+                .start_game(sender, slow_io)
+                .expect("Starting game");
         }
 
         let mut even_tick = true;
@@ -161,18 +160,21 @@ impl App {
                             let player_i = *player_i;
                             let player = &self.game.players[player_i];
                             if !player.crashed {
-                                if let Some(dir) = controls.handle(code) {
-                                    let mut execute_now = true;
+                                if let Some(direction) = controls.handle(code) {
+                                    let mut command = Some(SetDirectionCommand {
+                                        player_i,
+                                        direction,
+                                    });
 
                                     if let Some(networking) = &mut self.networking {
-                                        match networking.set_direction(dir) {
-                                            Ok(x) => execute_now = x,
+                                        match networking.set_direction(direction) {
+                                            Ok(cmd) => command = cmd,
                                             Err(error) => self.handle_networking_error(error),
                                         }
                                     }
 
-                                    if execute_now {
-                                        self.game.players[player_i].direction = dir;
+                                    if let Some(cmd) = command {
+                                        self.execute_command(cmd);
                                     }
                                 }
                             }
@@ -181,25 +183,23 @@ impl App {
                     _ => {}
                 },
 
-                ThreadMessage::Network(network_event) => {
-                    let networking = self.networking.as_mut().unwrap();
-
-                    match networking.handle_event(network_event) {
-                        EventOutcome::SetDirection(cmd) => {
-                            self.game.players[cmd.player_i].direction = cmd.direction;
-                        }
-                        EventOutcome::TheyLeft { politely } => {
-                            let msg = if politely {
-                                "They left!"
-                            } else {
-                                "Disconnected!"
-                            };
-                            self.ui.set_banner(Color::Yellow, msg.to_string());
-                            self.game.game_over = true;
-                        }
-                        EventOutcome::None => {}
+                ThreadMessage::Network(event) => match event {
+                    NetworkEvent::SetDirectionCommand(cmd) => {
+                        self.execute_command(cmd);
                     }
-                }
+                    NetworkEvent::RemoteLeft { politely } => {
+                        let msg = if politely {
+                            "They left!"
+                        } else {
+                            "Disconnected!"
+                        };
+                        self.ui.set_banner(Color::Yellow, msg.to_string());
+                        self.game.game_over = true;
+                    }
+                    NetworkEvent::ReceiveError(e) => {
+                        panic!("Failed to receive from socket: {:?}", e);
+                    }
+                },
 
                 ThreadMessage::Tick => {
                     even_tick = !even_tick;
@@ -252,13 +252,10 @@ impl App {
                                 match networking.start_new_frame(self.game.frame) {
                                     Ok(commands) => {
                                         for cmd in commands {
-                                            self.game.players[cmd.player_i].direction =
-                                                cmd.direction;
+                                            self.execute_command(cmd);
                                         }
                                     }
-                                    Err(error) => {
-                                        self.handle_networking_error(error);
-                                    }
+                                    Err(error) => self.handle_networking_error(error),
                                 }
                             }
                         }
@@ -272,6 +269,10 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn execute_command(&mut self, cmd: SetDirectionCommand) {
+        self.game.players[cmd.player_i].direction = cmd.direction;
     }
 
     fn handle_networking_error(&mut self, error: NetError) {
@@ -345,5 +346,19 @@ impl KeyboardControls {
 
     fn handle(&self, pressed_key_code: KeyCode) -> Option<Direction> {
         self.map.get(&pressed_key_code).copied()
+    }
+}
+
+pub struct SetDirectionCommand {
+    pub player_i: PlayerIndex,
+    pub direction: Direction,
+}
+
+impl SetDirectionCommand {
+    pub fn new(player_i: PlayerIndex, direction: Direction) -> Self {
+        Self {
+            player_i,
+            direction,
+        }
     }
 }
