@@ -1,8 +1,9 @@
 use crate::game::{
-    self, Direction, FrameReport, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
+    self, Direction, FrameEvent, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
 };
 use crate::net::{NetResult, NetworkEvent, Networking, Outcome};
-use crate::user_interface::TerminalUi;
+use crate::user_interface::{PlayerLabel, TerminalUi};
+use crate::Point;
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::Color;
@@ -30,12 +31,12 @@ pub enum StartPosition {
 }
 
 impl StartPosition {
-    fn resolve(&self, size: (u16, u16)) -> ((u16, u16), Direction) {
+    fn resolve(&self, size: (u16, u16)) -> (Point, Direction) {
         match self {
-            StartPosition::North => ((size.0 / 2, 1), DOWN),
-            StartPosition::West => ((1, size.1 / 2), RIGHT),
-            StartPosition::South => ((size.0 / 2, size.1 - 2), UP),
-            StartPosition::East => ((size.0 - 2, size.1 / 2), LEFT),
+            StartPosition::North => (((size.0 / 2) as i32, 0), DOWN),
+            StartPosition::West => ((0, (size.1 / 2) as i32), RIGHT),
+            StartPosition::South => (((size.0 / 2) as i32, (size.1 - 1) as i32), UP),
+            StartPosition::East => (((size.0 - 1) as i32, (size.1 / 2) as i32), LEFT),
         }
     }
 
@@ -60,8 +61,9 @@ pub struct App {
 impl App {
     pub fn new(mode: GameMode) -> anyhow::Result<Self> {
         let (terminal_w, terminal_h) = terminal::size()?;
-        let suggested_size = (min(25, terminal_w), max(terminal_h, 10));
-        let size;
+        let suggested_ui_size = (min(terminal_w, 40), min(max(10, terminal_h), 25));
+        let suggested_game_size: (u16, u16) = TerminalUi::compute_game_size(suggested_ui_size);
+        let game_size;
 
         let arrow_controls =
             KeyboardControls::new([KeyCode::Up, KeyCode::Left, KeyCode::Down, KeyCode::Right]);
@@ -81,11 +83,11 @@ impl App {
 
         match mode {
             GameMode::Host(socket, local_name) => {
-                size = suggested_size;
+                game_size = suggested_game_size;
                 let local_player = Player::new(
                     local_name.clone(),
                     Color::Blue,
-                    StartPosition::West.resolve(size),
+                    StartPosition::West.resolve(game_size),
                 );
 
                 let local_player_i = 0;
@@ -97,7 +99,7 @@ impl App {
                     remote_player_i,
                     local_player.direction,
                     frame,
-                    size,
+                    game_size,
                     local_name,
                 );
                 networking = Some(n);
@@ -105,7 +107,7 @@ impl App {
                 let remote_player = Player::new(
                     game_info.remote_player_name,
                     Color::Green,
-                    StartPosition::East.resolve(size),
+                    StartPosition::East.resolve(game_size),
                 );
                 players = vec![local_player, remote_player];
             }
@@ -123,40 +125,40 @@ impl App {
                     local_name.clone(),
                 );
                 networking = Some(n);
-                size = game_info.size;
+                game_size = game_info.size;
                 let remote_start_pos = StartPosition::West;
 
                 players = vec![
                     Player::new(
                         game_info.remote_player_name,
                         Color::Blue,
-                        remote_start_pos.resolve(size),
+                        remote_start_pos.resolve(game_size),
                     ),
-                    Player::new(local_name, Color::Green, local_start_pos.resolve(size)),
+                    Player::new(local_name, Color::Green, local_start_pos.resolve(game_size)),
                 ];
             }
             GameMode::Offline => {
-                size = suggested_size;
+                game_size = suggested_game_size;
                 players = vec![
                     Player::new(
-                        "P1".to_string(),
+                        "Mario".to_string(),
                         Color::Blue,
-                        StartPosition::West.resolve(size),
+                        StartPosition::West.resolve(game_size),
                     ),
                     Player::new(
-                        "P2".to_string(),
+                        "Bowser".to_string(),
                         Color::Green,
-                        StartPosition::East.resolve(size),
+                        StartPosition::East.resolve(game_size),
                     ),
                     Player::new(
                         "AI 1".to_string(),
-                        Color::Blue,
-                        StartPosition::North.resolve(size),
+                        Color::Magenta,
+                        StartPosition::North.resolve(game_size),
                     ),
                     Player::new(
                         "AI 2".to_string(),
                         Color::Cyan,
-                        StartPosition::South.resolve(size),
+                        StartPosition::South.resolve(game_size),
                     ),
                 ];
                 players_controlled_by_keyboard.push((wasd_controls, 0));
@@ -167,10 +169,21 @@ impl App {
             }
         };
 
-        let mut ui = TerminalUi::new(size, frame)?;
-        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", size));
+        let player_labels = players
+            .iter()
+            .map(|p| PlayerLabel {
+                name: p.name.clone(),
+                color: p.color,
+                score: p.score,
+                crashed: p.crashed,
+                disconnected: false,
+            })
+            .collect();
 
-        let game = Game::new(size, players, frame);
+        let mut ui = TerminalUi::new(game_size, frame, player_labels)?;
+        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", game_size));
+
+        let game = Game::new(game_size, players, frame);
 
         Ok(Self {
             game,
@@ -195,7 +208,14 @@ impl App {
             self.ui.draw_background()?;
 
             for player in &self.game.players {
-                self.ui.draw_colored_line(player.color, &player.line)?;
+                self.ui
+                    .draw_player_line(player.color, &player.line, player.direction)?;
+            }
+
+            for player in &self.game.players {
+                if player.crashed {
+                    self.ui.draw_crash(player.head())?;
+                }
             }
 
             self.ui.flush()?;
@@ -300,6 +320,7 @@ impl App {
                         "Disconnected!".to_string()
                     };
                     self.ui.set_banner(Color::Yellow, msg);
+                    self.ui.set_player_disconnected(player_i, true);
                     self.game.game_over = true;
                 }
             }
@@ -307,22 +328,31 @@ impl App {
     }
 
     fn run_frame(&mut self) {
-        if let Some(report) = self.game.run_frame() {
-            match report {
-                FrameReport::PlayerCrashed(i) => {
+        let frame_events = self.game.run_frame();
+        for event in frame_events {
+            match event {
+                FrameEvent::PlayerCrashed(i) => {
                     self.ui.set_banner(
                         Color::Yellow,
                         format!("{} crashed!", self.game.players[i].name),
                     );
+                    self.ui.set_player_crashed(i, true);
                 }
-                FrameReport::PlayerWon(color, name) => {
+                FrameEvent::PlayerWon(color, name) => {
                     self.ui.set_banner(color, format!("{} won!", name));
                 }
-                FrameReport::EveryoneCrashed => {
+                FrameEvent::EveryoneCrashed => {
                     self.ui
                         .set_banner(Color::Yellow, "Everyone crashed!".to_string());
+                    for i in 0..self.game.players.len() {
+                        self.ui.set_player_crashed(i, true);
+                    }
                 }
             }
+        }
+
+        for i in 0..self.game.players.len() {
+            self.ui.set_player_score(i, self.game.players[i].score);
         }
 
         for i in 0..self.players_controlled_by_ai.len() {
@@ -344,6 +374,7 @@ impl App {
             for dir in DIRECTIONS {
                 if self.game.is_vacant(game::translated(ai_head, dir)) {
                     self.game.players[player_index].direction = dir;
+                    break;
                 }
             }
         }

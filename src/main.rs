@@ -13,7 +13,7 @@ use app::App;
 
 use crate::app::GameMode;
 
-pub type Point = (u16, u16);
+pub type Point = (i32, i32);
 
 fn main() -> Result<()> {
     const HOST_ADDRESS: &str = "localhost:8000";

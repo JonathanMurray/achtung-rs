@@ -29,12 +29,12 @@ pub fn run(socket: TcpStream) {
     let remote_player = Player::new(
         game_info.remote_player_name,
         Color::Blue,
-        ((1, size.1 / 2), RIGHT),
+        ((1, (size.1 / 2) as i32), RIGHT),
     );
     let local_player = Player::new(
         local_player_name,
         Color::Green,
-        ((size.0 - 2, size.1 / 2), local_direction),
+        (((size.0 - 2) as i32, (size.1 / 2) as i32), local_direction),
     );
 
     let players = vec![remote_player, local_player];
@@ -116,8 +116,9 @@ fn execute_outcomes(game: &mut Game, networking: &mut Networking, outcomes: Vec<
             Outcome::RunFrame => {
                 println!("  Running frame {}", game.frame);
 
-                if let Some(report) = game.run_frame() {
-                    println!("  Game event: {:?}", report);
+                let frame_events = game.run_frame();
+                if !frame_events.is_empty() {
+                    println!("  Game events: {:?}", frame_events);
                 }
                 println!("  State: {:?}", game.players);
 

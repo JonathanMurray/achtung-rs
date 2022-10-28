@@ -28,8 +28,8 @@ impl Game {
         }
     }
 
-    pub fn run_frame(&mut self) -> Option<FrameReport> {
-        let mut report = None;
+    pub fn run_frame(&mut self) -> Vec<FrameEvent> {
+        let mut events = vec![];
         for player in &mut self.players {
             if !player.crashed {
                 player.advance_one_step();
@@ -39,31 +39,28 @@ impl Game {
         for i in 0..self.players.len() {
             if !self.players[i].crashed && self.is_player_crashing(i) {
                 self.players[i].crashed = true;
-                report = Some(FrameReport::PlayerCrashed(i));
+                events.push(FrameEvent::PlayerCrashed(i));
             }
         }
 
         let mut survivors = self.players.iter().filter(|p| !p.crashed);
         if let Some(survivor) = survivors.next() {
             if survivors.next().is_none() {
-                report = Some(FrameReport::PlayerWon(
-                    survivor.color,
-                    survivor.name.clone(),
-                ));
+                events.push(FrameEvent::PlayerWon(survivor.color, survivor.name.clone()));
                 self.game_over = true;
             }
         } else {
-            report = Some(FrameReport::EveryoneCrashed);
+            events.push(FrameEvent::EveryoneCrashed);
             self.game_over = true;
         }
 
         self.frame += 1;
 
-        report
+        events
     }
 
     fn is_within_game_bounds(&self, point: Point) -> bool {
-        point.0 > 0 && point.1 > 0 && point.0 < self.size.0 - 1 && point.1 < self.size.1 - 1
+        point.0 >= 0 && point.1 >= 0 && point.0 < self.size.0 as i32 && point.1 < self.size.1 as i32
     }
 
     pub fn is_vacant(&self, point: Point) -> bool {
@@ -100,7 +97,7 @@ impl Game {
 }
 
 #[derive(Debug)]
-pub enum FrameReport {
+pub enum FrameEvent {
     PlayerCrashed(PlayerIndex),
     PlayerWon(Color, String),
     EveryoneCrashed,
@@ -112,6 +109,7 @@ pub struct Player {
     pub color: Color,
     pub line: Vec<Point>,
     pub direction: Direction,
+    pub score: u32,
     pub crashed: bool,
 }
 
@@ -122,12 +120,14 @@ impl Player {
             color,
             line: vec![start_position.0],
             direction: start_position.1,
+            score: 0,
             crashed: false,
         }
     }
 
     fn advance_one_step(&mut self) {
         self.line.push(self.next_position());
+        self.score += 1;
     }
 
     fn next_position(&self) -> Point {
@@ -148,8 +148,5 @@ impl Player {
 }
 
 pub fn translated(point: Point, direction: Direction) -> Point {
-    (
-        (point.0 as i32 + direction.0) as u16,
-        (point.1 as i32 + direction.1) as u16,
-    )
+    (point.0 + direction.0, point.1 + direction.1)
 }
