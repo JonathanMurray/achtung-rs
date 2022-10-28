@@ -1,6 +1,6 @@
 use crate::app::ThreadMessage;
 use crate::game::{Game, Player, DOWN, LEFT, RIGHT, UP};
-use crate::net::{NetworkEvent, Networking};
+use crate::net::{NetworkEvent, Networking, Outcome};
 use crossterm::style::Color;
 use std::io::{stdout, Write};
 use std::net::TcpStream;
@@ -13,19 +13,26 @@ pub fn run(socket: TcpStream) {
     let remote_player_i = 0;
     let local_player_i = 1;
     let local_direction = LEFT;
-    let (mut networking, size) = Networking::join(
+    let local_player_name = "Headless client".to_string();
+    let (mut networking, game_info) = Networking::join(
         socket,
         local_player_i,
         remote_player_i,
         local_direction,
         frame,
+        local_player_name.clone(),
     );
 
-    println!("Game size: {:?}", size);
+    println!("Game info: {:?}", game_info);
 
-    let remote_player = Player::new("P1".to_string(), Color::Blue, ((1, size.1 / 2), RIGHT));
+    let size = game_info.size;
+    let remote_player = Player::new(
+        game_info.remote_player_name,
+        Color::Blue,
+        ((1, size.1 / 2), RIGHT),
+    );
     let local_player = Player::new(
-        "P2".to_string(),
+        local_player_name,
         Color::Green,
         ((size.0 - 2, size.1 / 2), local_direction),
     );
@@ -36,22 +43,17 @@ pub fn run(socket: TcpStream) {
 
     let (sender, receiver) = mpsc::channel();
 
-    let mut frame = frame;
-
     networking.start_game(sender, false).unwrap();
 
     let mut input = String::new();
     let stdin = std::io::stdin();
-    loop {
+    while !game.game_over {
+        println!("~~ frame {} ~~", game.frame);
         match receiver.try_recv() {
             Ok(ThreadMessage::Network(event)) => match event {
-                NetworkEvent::SetDirectionCommand(cmd) => {
-                    println!("Received : {:?}", cmd);
-                    game.players[cmd.player_i].direction = cmd.direction;
-                }
-                NetworkEvent::RemoteLeft { .. } => {
-                    println!("They left!");
-                    break;
+                NetworkEvent::BufferedOutcomes => {
+                    let outcomes = networking.take_buffered_outcomes();
+                    execute_outcomes(&mut game, &mut networking, outcomes);
                 }
                 NetworkEvent::ReceiveError(error) => {
                     panic!("Network error: {:?}", error);
@@ -63,8 +65,7 @@ pub fn run(socket: TcpStream) {
             Ok(ThreadMessage::Tick) => panic!("No tick in headless"),
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                println!("They left!");
-                break;
+                panic!("Network reader thread died")
             }
         }
 
@@ -74,7 +75,7 @@ pub fn run(socket: TcpStream) {
         stdin.read_line(&mut input).unwrap();
         input.make_ascii_lowercase();
 
-        let direction = if input.starts_with('w') {
+        let input_direction = if input.starts_with('w') {
             Some(UP)
         } else if input.starts_with('a') {
             Some(LEFT)
@@ -82,28 +83,51 @@ pub fn run(socket: TcpStream) {
             Some(DOWN)
         } else if input.starts_with('d') {
             Some(RIGHT)
+        } else if input.starts_with('q') {
+            break;
         } else {
             None
         };
 
-        let command = direction.and_then(|dir| networking.set_direction(dir).unwrap());
-
-        if let Some(cmd) = command {
-            game.players[cmd.player_i].direction = cmd.direction;
+        if let Some(direction) = input_direction {
+            let outcomes = networking.set_direction(direction).unwrap();
+            execute_outcomes(&mut game, &mut networking, outcomes);
         }
 
-        networking.commit_frame().unwrap();
-
-        if let Some(report) = game.run_frame() {
-            println!("GAME EVENT: {:?}", report);
-        }
-
-        frame += 1;
-        let commands = networking.start_new_frame(frame).unwrap();
-        for cmd in commands {
-            game.players[cmd.player_i].direction = cmd.direction;
-        }
+        println!("Committing frame.");
+        let outcomes = networking.commit_frame().unwrap();
+        execute_outcomes(&mut game, &mut networking, outcomes);
     }
 
+    println!("Game over. Press enter to exit.");
+    let mut input = String::new();
+    stdin.read_line(&mut input).unwrap();
+
     networking.exit();
+}
+
+fn execute_outcomes(game: &mut Game, networking: &mut Networking, outcomes: Vec<Outcome>) {
+    for outcome in outcomes {
+        println!("  outcome: {:?}", outcome);
+        match outcome {
+            Outcome::PlayerControl(control) => {
+                game.players[control.player_i].direction = control.direction;
+            }
+            Outcome::RunFrame => {
+                println!("  Running frame {}", game.frame);
+
+                if let Some(report) = game.run_frame() {
+                    println!("  Game event: {:?}", report);
+                }
+                println!("  State: {:?}", game.players);
+
+                let outcomes = networking.start_new_frame(game.frame).unwrap();
+                execute_outcomes(game, networking, outcomes);
+            }
+            Outcome::RemoteLeft { .. } => {
+                println!("  They left!");
+                game.game_over = true;
+            }
+        }
+    }
 }

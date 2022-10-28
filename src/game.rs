@@ -106,6 +106,7 @@ pub enum FrameReport {
     EveryoneCrashed,
 }
 
+#[derive(Debug)]
 pub struct Player {
     pub name: String,
     pub color: Color,
