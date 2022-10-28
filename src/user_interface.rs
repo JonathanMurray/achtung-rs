@@ -29,8 +29,6 @@ impl TerminalUi {
     }
 
     pub fn draw_background(&mut self) -> Result<()> {
-        self.stdout.queue(ResetColor)?;
-
         let (w, h) = self.size;
         self.stdout.queue(MoveTo(0, 0))?;
 
@@ -75,7 +73,7 @@ impl TerminalUi {
 
     fn draw_point(&mut self, point: Point) -> Result<()> {
         self.stdout.queue(MoveTo(point.0, point.1))?;
-        self.stdout.write_all("X".as_bytes())?;
+        self.stdout.write_all("#".as_bytes())?;
         Ok(())
     }
 
@@ -85,6 +83,7 @@ impl TerminalUi {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.stdout.queue(ResetColor)?;
         self.stdout.flush()?;
         Ok(())
     }
@@ -106,6 +105,7 @@ fn claim_terminal(stdout: &mut Stdout) -> Result<()> {
 
 pub fn restore_terminal(stdout: &mut Stdout) {
     stdout.queue(LeaveAlternateScreen).unwrap();
+    stdout.queue(ResetColor).unwrap();
     stdout.flush().unwrap();
     terminal::disable_raw_mode().unwrap();
 }
