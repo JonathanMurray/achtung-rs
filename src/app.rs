@@ -1,7 +1,7 @@
 use crate::game::{
     Direction, FrameReport, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
 };
-use crate::net::{NetworkEvent, NetworkPacket, Networking};
+use crate::net::{NetError, NetworkEvent, NetworkPacket, Networking};
 use crate::{game, TerminalUi};
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -66,15 +66,15 @@ impl App {
                     Player::new("P2".to_string(), Color::Green, east),
                 ];
                 players_controlled_by_keyboard.push((wasd_controls, 0));
-                networking = Some(Networking::new(socket, 1));
+                networking = Some(Networking::new(socket, 0, 1));
             }
             GameMode::Client(socket) => {
                 players = vec![
                     Player::new("P1".to_string(), Color::Blue, west),
                     Player::new("P2".to_string(), Color::Green, east),
                 ];
-                networking = Some(Networking::new(socket, 0));
                 players_controlled_by_keyboard.push((wasd_controls, 1));
+                networking = Some(Networking::new(socket, 1, 0));
             }
             GameMode::Offline => {
                 players = vec![
@@ -112,9 +112,16 @@ impl App {
             let (_controls, player_i) = &self.players_controlled_by_keyboard[0];
             let frame = self.game.frame;
             let direction = self.game.players[*player_i].direction;
-            networking.spawn_socket_reader(sender, slow_io)?;
-            networking.on_start_of_frame(frame, direction)?;
+            networking
+                .spawn_socket_reader(sender, slow_io)
+                .expect("Spawning socket reader");
+            let commands = networking
+                .start_new_frame(frame, direction)
+                .expect("Starting first frame");
+            assert!(commands.is_empty());
         }
+
+        let mut even_tick = true;
 
         loop {
             self.ui.draw_background()?;
@@ -142,13 +149,23 @@ impl App {
                         kind: KeyEventKind::Press,
                         ..
                     }) => {
-                        for (controls, player_i) in &self.players_controlled_by_keyboard {
-                            let player = &mut self.game.players[*player_i];
+                        for i in 0..self.players_controlled_by_keyboard.len() {
+                            let (controls, player_i) = &self.players_controlled_by_keyboard[i];
+                            let player_i = *player_i;
+                            let player = &self.game.players[player_i];
                             if !player.crashed {
                                 if let Some(dir) = controls.handle(code) {
-                                    player.direction = dir;
+                                    let mut execute_now = true;
+
                                     if let Some(networking) = &mut self.networking {
-                                        networking.send_direction_command(self.game.frame, dir)?;
+                                        match networking.set_direction(self.game.frame, dir) {
+                                            Ok(x) => execute_now = x,
+                                            Err(error) => self.handle_networking_error(error),
+                                        }
+                                    }
+
+                                    if execute_now {
+                                        self.game.players[player_i].direction = dir;
                                     }
                                 }
                             }
@@ -158,14 +175,19 @@ impl App {
                 },
 
                 ThreadMessage::Network(network_event) => match network_event {
+                    // TODO: Let networking module handle more of this
                     NetworkEvent::Received(packet) => match packet {
-                        NetworkPacket::Command(cmd) => {
+                        NetworkPacket::SetDirection(cmd) => {
                             let networking = self.networking.as_mut().unwrap();
                             if let Some((player_i, direction)) =
-                                networking.handle_received_command(cmd, self.game.frame)
+                                networking.receive_command(cmd, self.game.frame)
                             {
                                 self.game.players[player_i].direction = direction;
                             }
+                        }
+                        NetworkPacket::CommitFrame(frame_modulo) => {
+                            let networking = self.networking.as_mut().unwrap();
+                            networking.receive_commit(frame_modulo, self.game.frame);
                         }
                         NetworkPacket::GoodBye => {
                             self.ui.set_banner(Color::Yellow, "They left!".to_string());
@@ -173,7 +195,7 @@ impl App {
                         }
                     },
                     NetworkEvent::Error(e) => {
-                        panic!("{:?}", e);
+                        panic!("NetworkEvent::Error({:?})", e);
                     }
                     NetworkEvent::RemoteDisconnected => {
                         self.ui
@@ -183,49 +205,67 @@ impl App {
                 },
 
                 ThreadMessage::Tick => {
-                    let ready = self
-                        .networking
-                        .as_ref()
-                        .map(|networking| networking.ready_to_run_frame)
-                        .unwrap_or(true);
-                    if ready && !self.game.game_over {
-                        if let Some(report) = self.game.run_frame() {
-                            match report {
-                                FrameReport::PlayerCrashed(i) => {
-                                    self.ui.set_banner(
-                                        Color::Yellow,
-                                        format!("{} crashed!", self.game.players[i].name),
-                                    );
-                                }
-                                FrameReport::PlayerWon(color, name) => {
-                                    self.ui.set_banner(color, format!("{} won!", name));
-                                }
-                                FrameReport::EveryoneCrashed => {
-                                    self.ui
-                                        .set_banner(Color::Yellow, "Everyone crashed!".to_string());
+                    even_tick = !even_tick;
+
+                    if even_tick {
+                        if let Some(networking) = self.networking.as_mut() {
+                            if !self.game.game_over {
+                                if let Err(e) = networking.commit_frame(self.game.frame) {
+                                    self.handle_networking_error(e);
                                 }
                             }
                         }
-
-                        for i in 0..self.players_controlled_by_ai.len() {
-                            let player_i = self.players_controlled_by_ai[i];
-                            if !self.game.players[player_i].crashed {
-                                self.run_player_ai(player_i)
+                    } else {
+                        let ready = self
+                            .networking
+                            .as_ref()
+                            .map(|networking| networking.have_everyone_committed_frame())
+                            .unwrap_or(true);
+                        if ready && !self.game.game_over {
+                            if let Some(report) = self.game.run_frame() {
+                                match report {
+                                    FrameReport::PlayerCrashed(i) => {
+                                        self.ui.set_banner(
+                                            Color::Yellow,
+                                            format!("{} crashed!", self.game.players[i].name),
+                                        );
+                                    }
+                                    FrameReport::PlayerWon(color, name) => {
+                                        self.ui.set_banner(color, format!("{} won!", name));
+                                    }
+                                    FrameReport::EveryoneCrashed => {
+                                        self.ui.set_banner(
+                                            Color::Yellow,
+                                            "Everyone crashed!".to_string(),
+                                        );
+                                    }
+                                }
                             }
-                        }
 
-                        self.ui.set_frame(self.game.frame);
+                            for i in 0..self.players_controlled_by_ai.len() {
+                                let player_i = self.players_controlled_by_ai[i];
+                                if !self.game.players[player_i].crashed {
+                                    self.run_player_ai(player_i)
+                                }
+                            }
 
-                        if let Some(networking) = &mut self.networking {
-                            assert_eq!(self.players_controlled_by_keyboard.len(), 1);
-                            let local_player_i = self.players_controlled_by_keyboard[0].1;
-                            let local_player_direction =
-                                self.game.players[local_player_i].direction;
+                            self.ui.set_frame(self.game.frame);
 
-                            if let Some((remote_player_i, remote_direction)) = networking
-                                .on_start_of_frame(self.game.frame, local_player_direction)?
-                            {
-                                self.game.players[remote_player_i].direction = remote_direction;
+                            if let Some(networking) = &mut self.networking {
+                                assert_eq!(self.players_controlled_by_keyboard.len(), 1);
+                                let local_player_i = self.players_controlled_by_keyboard[0].1;
+                                let local_direction = self.game.players[local_player_i].direction;
+
+                                match networking.start_new_frame(self.game.frame, local_direction) {
+                                    Ok(commands) => {
+                                        for (player_i, direction) in commands {
+                                            self.game.players[player_i].direction = direction;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        self.handle_networking_error(error);
+                                    }
+                                }
                             }
                         }
                     }
@@ -234,10 +274,23 @@ impl App {
         }
 
         if let Some(networking) = &mut self.networking {
-            networking.on_exit();
+            networking.exit();
         }
 
         Ok(())
+    }
+
+    fn handle_networking_error(&mut self, error: NetError) {
+        match error {
+            NetError::Disconnected => {
+                self.ui
+                    .set_banner(Color::Yellow, "Oops, they disconnected!".to_string());
+                self.game.game_over = true;
+            }
+            NetError::Other(error) => {
+                panic!("Unexpected networking error: {:?}", error);
+            }
+        }
     }
 
     fn run_player_ai(&mut self, player_index: PlayerIndex) {
@@ -256,7 +309,7 @@ impl App {
 
     fn spawn_periodic_timer(sender: Sender<ThreadMessage>) {
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(75));
             if sender.send(ThreadMessage::Tick).is_err() {
                 // no receiver (i.e. main thread has exited)
                 break;

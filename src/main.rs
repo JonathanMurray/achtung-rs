@@ -43,8 +43,8 @@ fn main() -> Result<()> {
     setup_panic_handler();
 
     let slow_io = matches!(mode, GameMode::Host(_));
-    let mut app = App::new(mode)?;
-    app.run(slow_io)?;
+    let mut app = App::new(mode).expect("Creating app");
+    app.run(slow_io).expect("Running app");
 
     Ok(())
 }
