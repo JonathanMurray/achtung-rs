@@ -56,19 +56,9 @@ fn main() -> Result<()> {
         None => GameMode::Offline,
     };
 
-    setup_panic_handler();
-
     let slow_io = matches!(mode, GameMode::Host(..));
     let mut app = App::new(mode).expect("Creating app");
     app.run(slow_io).expect("Running app");
 
     Ok(())
-}
-
-fn setup_panic_handler() {
-    panic::set_hook(Box::new(move |panic_info| {
-        let mut stdout = io::stdout();
-        user_interface::restore_terminal(&mut stdout);
-        eprintln!("Panic: >{:?}<", panic_info);
-    }));
 }
