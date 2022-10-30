@@ -120,7 +120,7 @@ impl Networking {
     fn send_packet(&mut self, packet: SessionPacket, outcomes: &mut Vec<Outcome>) -> NetResult<()> {
         if let Err(io_error) = self.socket.write_all(&[packet.serialize()]) {
             match io_error.kind() {
-                ErrorKind::ConnectionReset => {
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => {
                     outcomes.push(Outcome::RemoteLeft { politely: false })
                 }
                 _ => return Err(io_error),
