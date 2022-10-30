@@ -2,19 +2,17 @@ use crate::game::{
     self, Direction, FrameEvent, Game, Player, PlayerIndex, DIRECTIONS, DOWN, LEFT, RIGHT, UP,
 };
 use crate::net::{NetResult, NetworkEvent, Networking, Outcome};
-use crate::user_interface::{PlayerLabel, TerminalUi};
+use crate::user_interface::TerminalUi;
 use crate::Point;
 use crossterm::event::Event::Key;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::Color;
-use crossterm::terminal;
-use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
+use tui::style::Color;
 
 #[derive(Debug)]
 pub enum GameMode {
@@ -60,9 +58,7 @@ pub struct App {
 
 impl App {
     pub fn new(mode: GameMode) -> anyhow::Result<Self> {
-        let (terminal_w, terminal_h) = terminal::size()?;
-        let suggested_ui_size = (min(terminal_w, 40), min(max(10, terminal_h), 25));
-        let suggested_game_size: (u16, u16) = TerminalUi::compute_game_size(suggested_ui_size);
+        let suggested_game_size = (35, 15);
         let game_size;
 
         let arrow_controls =
@@ -169,19 +165,8 @@ impl App {
             }
         };
 
-        let player_labels = players
-            .iter()
-            .map(|p| PlayerLabel {
-                name: p.name.clone(),
-                color: p.color,
-                score: p.score,
-                crashed: p.crashed,
-                disconnected: false,
-            })
-            .collect();
-
-        let mut ui = TerminalUi::new(game_size, frame, player_labels)?;
-        ui.set_banner(Color::Yellow, format!("Achtung! {:?}", game_size));
+        let mut ui = TerminalUi::new(game_size, players.clone());
+        ui.set_banner(Color::Yellow, "Go!");
 
         let game = Game::new(game_size, players, frame);
 
@@ -205,20 +190,7 @@ impl App {
         }
 
         loop {
-            self.ui.draw_background()?;
-
-            for player in &self.game.players {
-                self.ui
-                    .draw_player_line(player.color, &player.line, player.direction)?;
-            }
-
-            for player in &self.game.players {
-                if player.crashed {
-                    self.ui.draw_crash(player.head())?;
-                }
-            }
-
-            self.ui.flush()?;
+            self.ui.draw()?;
 
             match receiver.recv()? {
                 ThreadMessage::UserInput(event) => match event {
@@ -319,8 +291,7 @@ impl App {
                     } else {
                         "Disconnected!".to_string()
                     };
-                    self.ui.set_banner(Color::Yellow, msg);
-                    self.ui.set_player_disconnected(player_i, true);
+                    self.ui.set_banner(Color::Yellow, &msg);
                     self.game.game_over = true;
                 }
             }
@@ -329,21 +300,27 @@ impl App {
 
     fn run_frame(&mut self) {
         let frame_events = self.game.run_frame();
+
+        for i in 0..self.game.players.len() {
+            self.ui.set_player_line(i, &self.game.players[i].line);
+            self.ui
+                .set_player_direction(i, self.game.players[i].direction);
+        }
+
         for event in frame_events {
             match event {
                 FrameEvent::PlayerCrashed(i) => {
                     self.ui.set_banner(
                         Color::Yellow,
-                        format!("{} crashed!", self.game.players[i].name),
+                        &format!("{} crashed!", self.game.players[i].name),
                     );
                     self.ui.set_player_crashed(i, true);
                 }
                 FrameEvent::PlayerWon(color, name) => {
-                    self.ui.set_banner(color, format!("{} won!", name));
+                    self.ui.set_banner(color, &format!("{} won!", name));
                 }
                 FrameEvent::EveryoneCrashed => {
-                    self.ui
-                        .set_banner(Color::Yellow, "Everyone crashed!".to_string());
+                    self.ui.set_banner(Color::Yellow, "Everyone crashed!");
                     for i in 0..self.game.players.len() {
                         self.ui.set_player_crashed(i, true);
                     }
@@ -361,8 +338,6 @@ impl App {
                 self.run_player_ai(player_i)
             }
         }
-
-        self.ui.set_frame(self.game.frame);
     }
 
     fn run_player_ai(&mut self, player_index: PlayerIndex) {

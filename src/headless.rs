@@ -1,11 +1,11 @@
 use crate::app::ThreadMessage;
 use crate::game::{Game, Player, DOWN, LEFT, RIGHT, UP};
 use crate::net::{NetworkEvent, Networking, Outcome};
-use crossterm::style::Color;
 use std::io::{stdout, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
+use tui::style::Color;
 
 pub fn run(socket: TcpStream) {
     let frame = 1;

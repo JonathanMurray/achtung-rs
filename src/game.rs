@@ -1,5 +1,5 @@
 use crate::Point;
-use crossterm::style::Color;
+use tui::style::Color;
 
 pub type PlayerIndex = usize;
 pub type Direction = (i32, i32);
@@ -103,7 +103,7 @@ pub enum FrameEvent {
     EveryoneCrashed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Player {
     pub name: String,
     pub color: Color,
