@@ -58,7 +58,7 @@ pub struct App {
 
 impl App {
     pub fn new(mode: GameMode) -> anyhow::Result<Self> {
-        let suggested_game_size = (35, 15);
+        let suggested_game_size = (35, 16);
         let game_size;
 
         let arrow_controls =
