@@ -137,12 +137,12 @@ impl App {
                 game_size = suggested_game_size;
                 players = vec![
                     Player::new(
-                        "Mario".to_string(),
+                        "Player 1".to_string(),
                         Color::Blue,
                         StartPosition::West.resolve(game_size),
                     ),
                     Player::new(
-                        "Bowser".to_string(),
+                        "Player 2".to_string(),
                         Color::Green,
                         StartPosition::East.resolve(game_size),
                     ),
@@ -357,7 +357,7 @@ impl App {
 
     fn spawn_clock(sender: Sender<ThreadMessage>) {
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(120));
             if sender.send(ThreadMessage::Tick).is_err() {
                 // no receiver (i.e. main thread has exited)
                 break;
