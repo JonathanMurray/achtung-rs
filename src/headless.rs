@@ -43,7 +43,7 @@ pub fn run(socket: TcpStream) {
 
     let (sender, receiver) = mpsc::channel();
 
-    networking.start_game(sender, false).unwrap();
+    networking.start_game(sender).unwrap();
 
     let mut input = String::new();
     let stdin = std::io::stdin();

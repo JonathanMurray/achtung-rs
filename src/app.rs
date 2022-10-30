@@ -179,13 +179,13 @@ impl App {
         })
     }
 
-    pub fn run(&mut self, slow_io: bool) -> anyhow::Result<()> {
+    pub fn run(&mut self) -> anyhow::Result<()> {
         let (sender, receiver) = mpsc::channel();
         Self::spawn_clock(sender.clone());
         Self::spawn_input_listener(sender.clone());
 
         if let Some(networking) = &mut self.networking {
-            let result = networking.start_game(sender, slow_io);
+            let result = networking.start_game(sender);
             self.handle_net_result(result);
         }
 

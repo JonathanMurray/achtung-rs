@@ -13,41 +13,52 @@ use app::App;
 
 use crate::app::GameMode;
 
+const DEFAULT_PORT: u32 = 8000;
 pub type Point = (i32, i32);
 
 fn main() -> Result<()> {
-    const HOST_ADDRESS: &str = "localhost:8000";
-
     let args: Vec<String> = env::args().collect();
     let mode = match args.get(1).map(|s| &s[..]) {
         Some("host") => {
-            let listener = TcpListener::bind(HOST_ADDRESS)?;
+            let address = args
+                .get(2)
+                .map(String::to_string)
+                .unwrap_or_else(|| format!("localhost:{}", DEFAULT_PORT));
+            let listener = TcpListener::bind(address)?;
             let local_addr = listener.local_addr()?;
             print!("Waiting for client ({:?}) ... ", local_addr);
             io::stdout().flush()?;
             let (socket, address) = listener.accept()?;
             println!("SUCCESS: {:?}", address);
             let name = args
-                .get(2)
+                .get(3)
                 .map(String::to_string)
                 .unwrap_or_else(|| "Host".to_string());
             GameMode::Host(socket, name)
         }
         Some("client") => {
-            print!("Connecting ... ");
+            let address = args
+                .get(2)
+                .map(String::to_string)
+                .unwrap_or_else(|| format!("localhost:{}", DEFAULT_PORT));
+            print!("Connecting to host on {:?} ... ", address);
             io::stdout().flush()?;
-            let socket = TcpStream::connect(HOST_ADDRESS)?;
+            let socket = TcpStream::connect(address)?;
             println!("SUCCESS: {:?}", socket);
             let name = args
-                .get(2)
+                .get(3)
                 .map(String::to_string)
                 .unwrap_or_else(|| "Client".to_string());
             GameMode::Client(socket, name)
         }
         Some("headless") => {
-            print!("Connecting ... ");
+            let address = args
+                .get(2)
+                .map(String::to_string)
+                .unwrap_or_else(|| format!("localhost:{}", DEFAULT_PORT));
+            print!("Connecting to host on {:?} ... ", address);
             io::stdout().flush()?;
-            let socket = TcpStream::connect(HOST_ADDRESS)?;
+            let socket = TcpStream::connect(address)?;
             println!("SUCCESS: {:?}", socket);
             headless::run(socket);
             return Ok(());
@@ -56,9 +67,8 @@ fn main() -> Result<()> {
         None => GameMode::Offline,
     };
 
-    let slow_io = matches!(mode, GameMode::Host(..));
     let mut app = App::new(mode).expect("Creating app");
-    app.run(slow_io).expect("Running app");
+    app.run().expect("Running app");
 
     Ok(())
 }

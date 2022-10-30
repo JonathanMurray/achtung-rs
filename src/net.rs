@@ -5,7 +5,6 @@ use std::net::TcpStream;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 pub struct Networking {
     socket: TcpStream,
@@ -70,12 +69,8 @@ impl Networking {
         (Self { socket, session }, game_info)
     }
 
-    pub fn start_game(
-        &mut self,
-        sender: Sender<ThreadMessage>,
-        slow_io: bool,
-    ) -> NetResult<Vec<Outcome>> {
-        self.spawn_socket_reader(sender, slow_io)?;
+    pub fn start_game(&mut self, sender: Sender<ThreadMessage>) -> NetResult<Vec<Outcome>> {
+        self.spawn_socket_reader(sender)?;
 
         let outgoing_packet = self.session.lock().unwrap().start_game();
         let mut outcomes = vec![];
@@ -135,14 +130,10 @@ impl Networking {
         Ok(())
     }
 
-    pub fn spawn_socket_reader(
-        &mut self,
-        sender: Sender<ThreadMessage>,
-        slow_io: bool,
-    ) -> NetResult<()> {
+    pub fn spawn_socket_reader(&mut self, sender: Sender<ThreadMessage>) -> NetResult<()> {
         let socket = self.socket.try_clone()?;
         let session = Arc::clone(&self.session);
-        thread::spawn(move || run_socket_reader(socket, sender, session, slow_io));
+        thread::spawn(move || run_socket_reader(socket, sender, session));
         Ok(())
     }
 }
@@ -320,17 +311,12 @@ fn run_socket_reader(
     mut socket: TcpStream,
     sender: Sender<ThreadMessage>,
     session: Arc<Mutex<Session>>,
-    slow_io: bool,
 ) {
     let mut buf = Vec::new();
     let mut read_buf = [0; 1024];
     loop {
         match socket.read(&mut read_buf) {
             Ok(n) => {
-                if slow_io {
-                    thread::sleep(Duration::from_millis(10)); //TODO
-                }
-
                 buf.extend_from_slice(&read_buf[..n]);
 
                 for byte in &buf {
